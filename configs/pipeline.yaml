@@ -27,6 +27,26 @@ blocking:
   query_chunk: 20000
   n_threads: 0          # 0 = all cores
 
+baseline:
+  # retrieval (experiment E0b): word 1+2-gram TF-IDF on name+address, record-side
+  k_rec: 3              # top-k S1 per S2/S3 record (candidate set = k_rec x records)
+  max_df: 0.01          # block purging: drop n-grams in >1% of the country's records
+  min_score: 0.0        # cosine floor for a candidate
+  workers: 8            # featurization processes (memory-bound; 8 fits in 16 GB)
+  chunk: 50000          # rows per vectorization / search chunk
+  # model
+  train_frac: 0.3       # share of training-fold entities (all their pairs) used per fold model
+  lgb:
+    learning_rate: 0.1
+    num_leaves: 63
+    min_data_in_leaf: 200
+    feature_fraction: 0.9
+    bagging_fraction: 0.8
+    bagging_freq: 1
+    num_rounds: 400
+    early_stopping: 30
+  grid: [0.10, 0.95, 0.05]   # T_first / T_rest search grid: [low, high, step]
+
 bootstrap:
   n_resamples: 1000
   alpha: 0.05

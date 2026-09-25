@@ -37,6 +37,11 @@ So precision and the first admission (empty vs non-empty) dominate.
   - **version history of all submissions** (shortlisting is based on the submitted solutions)
 - The portal is used from one machine per participant (no simultaneous logins).
 - **Ask the organizers via the Google Form:** which submission is used for the private LB, the last one or the best one? The Sub #5 strategy (§3) depends on the answer.
+- **[C] Organizer update (25 Sep): candidate generation counts toward the final ranking.** `candidate_pairs.tsv` and the code producing it are reviewed alongside the F0.5 score. **A smaller candidate set per S1 entity ranks higher**, and blocking must scale (billions of records at Amazon; no all-pairs comparison). Consequences:
+  - The blocking objective is now **two-sided**: keep the entity-level recall ceiling (oracle F0.5) high **and** make mean |C| per S1 small.
+  - How the organizers weigh |C| against F0.5 is **not published**. Also ask this via the Google Form. Until answered, the selection rule in Step 3 is [J].
+  - The methodology doc must explain *why* the blocking scales (complexity, partitioning), not only that it ran.
+- **[C] Prohibited services:** AWS Entity Resolution and AWS Glue FindMatches are managed matching services, i.e. the "commercial entity resolution APIs or services" the fair-play rules forbid. AWS **compute** (SageMaker, EMR/Spark, S3) is fine; AWS **matching services** are not. Blocking and matching must be our own code on open-source libraries.
 
 **Compute [R]:** all-pairs (~2×10¹³) is impossible, so the cascade is required.
 - Work runs on **SageMaker** (credits provided): a high-memory, high-core CPU instance for retrieval, features and GBDT, and a GPU instance only for the optional transformer and dense arms.
@@ -81,12 +86,17 @@ So precision and the first admission (empty vs non-empty) dominate.
       │   space-stripped name · script flags · digits (house-no, postal, digit-runs)
       │   [EXP] all-Indic transliteration view
       ▼
- [2] CANDIDATE GENERATION (same-country hard filter first)
-      │   char-3g TF-IDF (max_df-pruned), top-k PER SOURCE:
-      │     name+addr (backbone)  ∪  address-only [EXP, strongly indicated]
-      │     ∪ reverse S2/S3→S1 top-k [EXP]   ∪ name-only [EXP]
-      │   plain union → per-source cap → candidate_pairs.tsv
-      │   AUDIT: oracle macro-F0.5 per stratum (post-cap), |C|, RR, runtime
+ [2] CANDIDATE GENERATION: 3-stage blocking cascade (Step 3)
+      │   B0  same-country partition (exact) → every later stage runs per partition, in parallel
+      │   B1  cheap high-recall retrievers, RECORD-SIDE first (each S2/S3 → top-k_r S1):
+      │         sparse char-3g TF-IDF with block purging (df cap) on name+addr ∪ address-only
+      │         ∪ small forward S1→top-k_f per source   ∪ exact keys (name, addr+house-no)
+      │         ∪ [EXP, GPU] dense multilingual embeddings + HNSW (cross-script / abbreviations)
+      │   B2  supervised meta-blocking pruner: tiny LightGBM on blocking-graph features
+      │         (scores, ranks both directions, gaps, #retrievers agreeing) →
+      │         keep ≤ c_r S1 per record, p ≥ τ_b, ≤ c_s per source per S1
+      │   → candidate_pairs.tsv (= exactly what the final matcher scores)
+      │   AUDIT: Pareto front of oracle macro-F0.5 vs mean |C| per S1; RR; runtime
       ▼
  [3] PAIR SCORING
       │   features (no country, no target encoding) → LightGBM stage 1 (5-fold full-universe OOF)
@@ -131,20 +141,68 @@ Additive views, never destructive:
 
 All-Indic transliteration (ISO-15919-style table applied via per-block offset) is written now but used only after Step 3 shows where it helps.
 
-### Step 3 — Full-universe rank table (Day 1, the decisive recall experiment)
-1. **Timing run** on a 1% slice per view. Extrapolate before launching the full run. High-df n-grams dominate the cost, so prune them with `max_df`.
-2. On the **full train universe** (all S1 × all S2/S3, per country; India first, then US):
-   - Views: NA = name+addr, A = address-only, N = name-only (T = transliterated added later if needed).
-   - Directions: forward S1→S2 and S1→S3 separately at k ≤ 50, plus reverse S2/S3→S1 at k ≤ 10 for NA.
-3. Store **each true pair's rank in every (view, direction)**. Every view subset and K can then be evaluated offline without re-running retrieval.
-4. Report per stratum:
-   - oracle macro-F0.5 of the **capped union**
-   - marginal oracle gain per view
-   - |C| median / p90 / max
-   - reduction ratio
-   - wall-clock
-5. **Selection rule:** add views greedily by oracle-F0.5 gain per unit |C|. Stop when the next gain's CI includes 0. K per source is the smallest K whose oracle F0.5 is within the CI of K_max.
-6. The same code runs on test to produce `candidate_pairs.tsv`. These tables go straight into the methodology doc's blocking-audit section [C].
+### Step 3 — Blocking v5: scalable cascade with a small candidate set (Day 1–2)
+
+**Why it changed.** The organizers now rank a smaller candidate set per S1 higher [C], and v4's design (up to 50 forward candidates per source per S1, plain union) optimizes recall only. The ER literature handles this with a cascade: cheap schema-agnostic blocking for recall, then **meta-blocking**, which scores every candidate pair from blocking-level evidence and prunes the weak ones [L: Papadakis et al. 2020 survey; Gagliardelli et al. 2022 generalized supervised meta-blocking]. Our data adds one structural advantage: each S2/S3 record has **at most one** S1 parent [D], so record-side retrieval has a natural, tiny cardinality.
+
+**Size arithmetic** (from row counts [D][R], not a performance claim):
+- Record-side top-k_r gives exactly k_r candidates per S2/S3 record, i.e. about **5.8 × k_r per S1 on test** before pruning (9.97M records / 1.73M S1).
+- The floor is the number of true matches: 3.46 per S1 on train [D]. About 26% of records are orphans [R], and a pruner can drop many of them.
+- Forward S1→top-k_f per source adds up to 2·k_f per S1.
+
+#### B0 — Partition (exact)
+Same-country join [D]. Every later stage runs per country partition, chunked, in parallel. This is also the scaling story for the methodology doc: work is partitioned, never all-pairs. Finer partitions (e.g. city or postal prefix) are the standard next step at billions of records; with our sizes, country is enough.
+
+#### B1 — Cheap high-recall retrievers (unsupervised)
+| ID | Retriever | Why | Cost control |
+|---|---|---|---|
+| R1 | char-3g TF-IDF, **name+addr**, record→S1 top-k_r (**primary**) | Backbone lexical retriever [D probe]; record side exploits one-to-one | **Block purging:** drop n-grams with df above a cap (the 25-min/1% timing run showed common n-grams dominate the cost) |
+| R2 | char-3g TF-IDF, **address-only**, record→S1 | Carries cross-script / garbled-name pairs [R7] | same |
+| R3 | forward S1→top-k_f per source (name+addr) | Recovers records whose own top list is crowded by chain look-alikes | small k_f only |
+| R4 | exact keys: normalized name; address digits + first street token | Near-free; high precision band | blocks larger than a cap are purged (a chain name is not a key) |
+| R5 | [EXP, GPU] dense multilingual sentence embeddings (MIT/Apache model) + HNSW/FAISS, record→S1 | Dense and sparse blockers are complementary [L: UniBlocker 2024]; targets cross-script and abbreviations | Only if R1–R4 leave a material oracle-F0.5 loss on the Indic stratum; encode on GPU |
+
+#### B2 — Supervised meta-blocking pruner (the key to a small |C|)
+- For every pair in the B1 union, blocking-graph features:
+  - each retriever's score
+  - rank of the S1 in the record's list, and rank of the record in the S1's list
+  - gap to the record's best S1 score, and gap to the S1's best in the same source
+  - number of retrievers that found the pair
+  - 2–3 cheap string checks (name/address token Jaccard, house-number agreement)
+- A **small LightGBM**, trained fold-wise on train, gives p(match).
+- Pruning, all three tunable:
+  - **record-side cardinality:** keep ≤ c_r best S1 per record. This is the record-side form of cardinality node pruning.
+  - **floor:** p ≥ τ_b
+  - **S1-side cap:** ≤ c_s per source per S1 (true maxima are 5 and 6 [R])
+- The pruned set **is** `candidate_pairs.tsv`: the last filtering stage before the final matcher, as the rules define it [C].
+
+#### Metrics (fold 0, full universe)
+- **Oracle macro-F0.5** of the candidate set (the entity-level ceiling), overall and per stratum.
+- **Mean / p90 / max |C| per S1** and **reduction ratio** (1 − |C| / same-country all-pairs).
+- **Wall-clock** per stage on SageMaker.
+- **End-to-end macro-F0.5** after the final matcher: a loose vs pruned candidate set, compared by paired bootstrap. This is the tie-breaker, since a tighter set may help or hurt the matcher [H].
+
+**Selection rule [J]** (until the organizers publish the |C| weighting):
+- Take the **Pareto front** of oracle-F0.5 against mean |C|.
+- Choose the **smallest mean |C| whose end-to-end F0.5 is within the paired-bootstrap CI of the best configuration**.
+- Where two configurations tie, the smaller |C| wins.
+
+#### Experiments, in order (each reuses the stored top-k lists; retrieval runs once per retriever)
+| # | Experiment | Hyperparameters swept |
+|---|---|---|
+| E0 | Speed fix: profile, then block purging | df cap ∈ {0.5%, 1%, 2%, 5%} of partition size; n-gram 3 vs word tokens; query chunk size. Gate: full India R1 ≤ 30 min [J] |
+| E1 | R1 record-side alone | k_r ∈ {1, 2, 3, 5}: oracle-F0.5 vs mean \|C\| |
+| E2 | + R2, + R3, + R4 (marginal each) | k_f ∈ {2, 3, 5}; key block cap ∈ {20, 50} |
+| E3 | B2 pruner | c_r ∈ {1, 2}; τ_b sweep; c_s ∈ {5, 6, 8}: full Pareto front |
+| E4 | [EXP] R5 dense on the Indic stratum | model; k_r ∈ {1, 3} |
+| E5 | End-to-end tie-break | loose (E2) vs chosen pruned set (E3) through the Step 6 matcher |
+
+Code reuse:
+- [src/ber/blocking/retrieve.py](src/ber/blocking/retrieve.py) already produces forward and reverse lists.
+- [rank_table.py](src/ber/blocking/rank_table.py) and [audit.py](src/ber/blocking/audit.py) already compute oracle-F0.5 and |C| for any mix.
+- New pieces: block-purging parameters, R4 keys, the B2 pruner module, a Pareto-front report, and (EXP) the dense retriever.
+
+The same code runs on test (all countries, France included) to produce `candidate_pairs.tsv`. The Pareto tables and complexity argument go into the methodology doc's blocking section [C].
 
 ### Step 4 — Validation design (Day 1)
 - **5-fold entity-level cross-fitting on the full train universe.** S1 entities are stratified by country × k-bucket; a pair inherits its S1's fold. Orphans enter only as negatives, wherever they're retrieved.
@@ -234,8 +292,9 @@ A0/A1/A2 arbitration: none / hard (record → argmax S1 above T) / soft (= stage
 
 | Gate | Question | Why this metric answers it | KEEP | DROP | INVESTIGATE |
 |---|---|---|---|---|---|
-| G1 view | Does view V (A, reverse, N, T, dense) pay for itself? | Marginal **oracle-F0.5** on its target stratum is the entity-level ceiling it adds | Gain CI > 0 and ≥ 0.002 on the stratum, runtime acceptable | CI includes 0 | Gain real but runtime > 2h → scope-reduced version |
-| G1b K | Smallest safe K per source | Oracle-F0.5 vs K curve, post-cap | Smallest K within CI of K_max | — | Curve still rising at K_max → extend |
+| G1 retriever | Does retriever R2–R5 pay for itself? | Marginal **oracle-F0.5** on its target stratum *per unit of added mean \|C\|* | Gain CI > 0 and ≥ 0.002 on the stratum, runtime acceptable | CI includes 0 | Gain real but runtime > 2h → scope-reduced version (e.g. Indic records only) |
+| G1b size | Smallest candidate set that doesn't cost score | Pareto front oracle-F0.5 vs mean \|C\|, then end-to-end F0.5 (E5) | Smallest mean \|C\| whose end-to-end F0.5 is within CI of the best configuration [J] | — | Organizers publish a \|C\| weighting → re-derive the rule from it |
+| G1c pruner | Does the B2 meta-blocking pruner beat plain top-k cut-offs? | Pareto fronts compared at equal mean \|C\| | Pruner's oracle-F0.5 higher at the chosen \|C\|, CI > 0 | Otherwise use plain k_r/k_f cut-offs | — |
 | G2 ML | Does M1 beat M0? | End-to-end macro-F0.5 | M1 − M0 CI > 0 (expected) | Otherwise ship M0 | — |
 | G3 stage 2 | Do competition/sibling features help? | End-to-end, same decision arm | Δ CI > 0 and ≥ 0.002 | Otherwise | — |
 | G4 decision | Is a richer rule better? | End-to-end on fold 0, params from folds 1–4 | D(n+1) beats D(n), CI > 0 | Keep the simpler rule | Gains differ strongly by country → transfer risk to France; keep the simpler rule |
@@ -290,5 +349,14 @@ A0/A1/A2 arbitration: none / hard (record → argmax S1 above T) / soft (= stage
 - [D] phase0_report.md §§1–6 (+ `phase0/stats/*.json`, not present locally).
 - [R] phase0_report.md §8: full-data re-measurement 2026-09-25 (`check.py`, `check2.py`, `check3.py`).
 - [L] strategy_v2_corrected.md references (hard negatives; blocking surveys; F-measure decision theory); feature-based GBDT as a strong ER baseline.
+- [L] blocking (Step 3 v5):
+  - Papadakis, Skoutas, Thanos, Palpanas, "Blocking and Filtering Techniques for Entity Resolution: A Survey", ACM CSUR 53(2), 2020: block purging/filtering, meta-blocking, cardinality pruning.
+  - Gagliardelli, Papadakis, Simonini, Bergamaschi, Palpanas, "Generalized Supervised Meta-blocking", arXiv:2204.08801, 2022: classifier-scored candidate pairs + pruning.
+  - Papadakis et al., "Comparative Analysis of Approximate Blocking Techniques", PVLDB 9, 2016.
+  - Barlaug, "ShallowBlocker", arXiv:2312.15835, 2023: absolute + relative similarity + local cardinality conditions.
+  - Brinkmann, Shraga, Bizer, "SC-Block", arXiv:2303.03132, 2023: contrastive dense blocking + nearest-neighbour search inside full pipelines.
+  - Wang et al., "Towards Universal Dense Blocking" (UniBlocker), arXiv:2404.14831, 2024: dense and sparse blocking are complementary.
+  - Wei, Dong, Sisman et al., "AutoBlock", WSDM 2020 (Amazon): representation learning + nearest-neighbour blocking.
+  - Splink docs: blocking rules and scaling on DuckDB/Spark.
 - [H]/[J] flagged inline; each [H] maps to a Step and a gate in §4.
 - **Pending:** AWS "ML Challenge 2026 prep guide" blog (SageMaker setup and limits). The page is JS-rendered and couldn't be fetched; paste its text to fill in §0 Compute.

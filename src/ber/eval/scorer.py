@@ -46,6 +46,20 @@ def per_entity_scores(truth: pd.DataFrame, pred: pd.DataFrame, entities) -> pd.D
     return pd.DataFrame({"k": kv, "m": mv, "tp": tv, "f05": f}, index=entities)
 
 
+def f05_from_counts(k, m, tp) -> np.ndarray:
+    """Per-entity F0.5 from counts: true matches ``k``, predicted ``m``, correct ``tp``.
+
+    Same rules as :func:`per_entity_scores`, on integer arrays: this is the fast
+    path for threshold sweeps (no string joins).
+    """
+    k, m, tp = (np.asarray(x, dtype=np.float64) for x in (k, m, tp))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        p = np.where(m > 0, tp / np.maximum(m, 1), 0.0)
+        r = np.where(k > 0, tp / np.maximum(k, 1), 0.0)
+        f = np.where(tp > 0, (1 + BETA2) * p * r / (BETA2 * p + r), 0.0)
+    return np.where(k == 0, (m == 0).astype(float), f)
+
+
 def macro_f05(truth: pd.DataFrame, pred: pd.DataFrame, entities) -> float:
     """Macro-averaged F0.5 over ``entities`` (the leaderboard number)."""
     return float(per_entity_scores(truth, pred, entities)["f05"].mean())

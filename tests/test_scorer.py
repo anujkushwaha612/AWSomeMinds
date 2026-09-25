@@ -50,6 +50,16 @@ def test_hand_cases(truth, pred, expected):
     assert score(truth, pred, ["e"])["e"] == pytest.approx(expected)
 
 
+def test_f05_from_counts_matches_scorer():
+    from ber.eval.scorer import f05_from_counts
+    # k, m, tp for: singleton empty, singleton FP, miss, exact, 3/4, 4/4+1FP, 2TP+1FP
+    k = [0, 0, 1, 1, 4, 4, 2]
+    m = [0, 1, 0, 1, 3, 5, 3]
+    tp = [0, 0, 0, 1, 3, 4, 2]
+    want = [1.0, 0.0, 0.0, 1.0, 0.9375, f05(0.8, 1.0), f05(2 / 3, 1.0)]
+    np.testing.assert_allclose(f05_from_counts(k, m, tp), want)
+
+
 def test_duplicate_predictions_count_once():
     s = score([("e", "S2-1")], [("e", "S2-1"), ("e", "S2-1")], ["e"])
     assert s["e"] == 1.0
