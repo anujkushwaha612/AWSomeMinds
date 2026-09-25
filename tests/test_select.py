@@ -203,3 +203,80 @@ def test_policy_loads_from_the_pipeline_config():
     assert pol.cap_s2 >= 5 and pol.cap_s3 >= 6      # never below the measured caps
     assert 1 <= pol.a_max <= 5
     assert P.from_config({"a_max": 1, "unknown_key": 3}).a_max == 1
+
+
+# ---------------------------------------------------------------- run helpers
+
+
+def test_derived_r_ent_ranks_records_competing_for_the_same_entity():
+    from ber.blocking.run import derive_r_ent
+    pairs = pd.DataFrame({
+        "s1_row": [0, 0, 0, 1],
+        "src": [2, 2, 2, 2],
+        "score": [0.3, 0.9, 0.6, 0.2],
+    })
+    assert list(derive_r_ent(pairs)) == [2, 0, 1, 0]
+
+
+def test_derived_r_ent_separates_the_two_sources():
+    from ber.blocking.run import derive_r_ent
+    pairs = pd.DataFrame({"s1_row": [0, 0], "src": [2, 3], "score": [0.3, 0.9]})
+    assert list(derive_r_ent(pairs)) == [0, 0]
+
+
+def test_parse_knobs_keeps_integer_knobs_integral():
+    from ber.blocking.tune import parse_knobs
+    knobs = parse_knobs(["a_max=1,2,3", "score_floor=0.1,0.2"])
+    assert knobs["a_max"] == [1, 2, 3]
+    assert all(isinstance(v, int) for v in knobs["a_max"])
+    assert knobs["score_floor"] == [0.1, 0.2]
+
+
+def test_parse_knobs_rejects_an_unknown_knob():
+    from ber.blocking.tune import parse_knobs
+    with pytest.raises(SystemExit):
+        parse_knobs(["not_a_knob=1"])
+
+
+def test_record_view_locates_the_true_parent_rank():
+    from ber.blocking.tune import record_view
+    pairs = make_pairs([("A", "S2-1", 2, 0.9, 0, 0, 1),
+                        ("B", "S2-1", 2, 0.5, 1, -1, 1),
+                        ("C", "S2-2", 2, 0.4, 0, -1, 1)])
+    truth = pd.DataFrame({"s1": ["B"], "rid": ["S2-1"]})
+    rv = record_view(pairs, truth).set_index("rid")
+    assert rv.loc["S2-1", "parent_rank"] == 1          # parent is the runner-up
+    assert not rv.loc["S2-1", "parent_is_top1"]
+    assert rv.loc["S2-1", "has_parent"]
+    assert not rv.loc["S2-2", "has_parent"]            # orphan record
+    assert rv.loc["S2-2", "parent_rank"] == -1
+
+
+def test_abstain_table_trades_declined_records_against_lost_pairs():
+    from ber.blocking.tune import abstain_table
+    rv = pd.DataFrame({
+        "top1": [0.9, 0.1, 0.1, 0.8],
+        "has_parent": [True, True, False, False],
+        "parent_rank": [0, 0, -1, -1],
+    })
+    t = abstain_table(rv, grid=[0.0, 0.5]).set_index("abstain_score")
+    assert t.loc[0.0, "records_declined"] == 0.0
+    assert t.loc[0.5, "records_declined"] == pytest.approx(0.5)
+    assert t.loc[0.5, "true_pairs_lost"] == pytest.approx(0.5)   # 1 of 2 retrievable
+    assert t.loc[0.5, "orphans_caught"] == pytest.approx(0.5)    # 1 of 2 orphans
+
+
+def test_operating_point_treats_sub_materiality_deficits_as_ties():
+    from ber.blocking.metrics import pick_operating_point
+    rng = np.random.default_rng(3)
+    rows = [(f"S1-{int(s)}", f"S2-{r}", 2, float(rng.random()), int(i), 0, 1)
+            for r in range(400)
+            for i, s in enumerate(rng.choice(80, size=4, replace=False))]
+    pairs = make_pairs(rows)
+    truth = pairs.groupby("rid").head(1)[["s1", "rid"]]
+    entities = sorted(pairs["s1"].unique())
+    pols = {"tight": SelectPolicy(a_max=1), "loose": SelectPolicy(a_max=3)}
+    op = pick_operating_point(pairs, truth, entities, pols, n_resamples=100,
+                              materiality=1.0)
+    assert op["tied_with_best"].all()                  # everything ties at a huge bar
+    assert op.iloc[0]["C_per_s1_mean"] <= op.iloc[-1]["C_per_s1_mean"]

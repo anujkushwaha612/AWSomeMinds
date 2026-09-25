@@ -138,14 +138,22 @@ def frontier(pairs: pd.DataFrame, truth: pd.DataFrame, entities, base_policy,
 
 def pick_operating_point(pairs: pd.DataFrame, truth: pd.DataFrame, entities,
                          policies: dict, n_resamples: int = 500,
-                         select_fn=None) -> pd.DataFrame:
+                         select_fn=None, materiality: float | None = None) -> pd.DataFrame:
     """Rank candidate policies by size, keeping only those tied with the best.
 
     For every policy this reports the oracle F0.5, the candidate-set size and a
     paired-bootstrap CI of its oracle F0.5 *deficit* against the best policy in
-    the set. ``tied_with_best`` marks the policies whose deficit CI contains 0;
-    the operating point is the smallest such candidate set.
+    the set. A policy counts as ``tied_with_best`` when the deficit CI contains
+    0 **or** the deficit is smaller than ``materiality`` (default:
+    ``bootstrap.materiality`` from the config, 0.002 macro-F0.5). The operating
+    point is the smallest candidate set among the tied policies: at these sample
+    sizes the CI can exclude a deficit of 0.0001, which is not a reason to carry
+    30% more candidates.
     """
+    from ..config import load_config
+
+    if materiality is None:
+        materiality = load_config().get("bootstrap", {}).get("materiality", 0.002)
     from .select import select as default_select
 
     select_fn = select_fn or default_select
@@ -166,5 +174,7 @@ def pick_operating_point(pairs: pd.DataFrame, truth: pd.DataFrame, entities,
     df["delta_vs_best"] = [s["delta"] for s in stats]
     df["ci_low"] = [s["ci_low"] for s in stats]
     df["ci_high"] = [s["ci_high"] for s in stats]
-    df["tied_with_best"] = [s["ci_low"] <= 0 <= s["ci_high"] for s in stats]
+    df["tied_with_best"] = [(s["ci_low"] <= 0 <= s["ci_high"])
+                            or (abs(s["delta"]) < materiality) for s in stats]
+    df["materiality"] = materiality
     return df.sort_values("C_per_s1_mean").reset_index(drop=True)

@@ -28,12 +28,20 @@ import string
 import numpy as np
 import pandas as pd
 
-# test-set proportions, phase0_report.md section 1
-COUNTRIES = {
-    "US":     {"s1": 663_106, "s2": 1_871_330, "s3": 1_945_701, "dup": 0.27, "indic": 0.0},
-    "India":  {"s1": 809_986, "s2": 2_312_565, "s3": 2_405_000, "dup": 0.37, "indic": 1.0},
-    "France": {"s1": 259_452, "s2": 703_378,   "s3": 731_615,   "dup": 0.26, "indic": 0.0},
+# row counts per split, phase0_report.md section 1. Train is US + India only and
+# has 4.68 records per S1; test adds France and has 5.75.
+SPLITS = {
+    "train": {
+        "US":    {"s1": 1_323_633, "s2": 3_016_817, "s3": 3_170_056, "dup": 0.27},
+        "India": {"s1":   883_188, "s2": 2_017_799, "s3": 2_115_547, "dup": 0.37},
+    },
+    "test": {
+        "US":     {"s1": 663_106, "s2": 1_871_330, "s3": 1_945_701, "dup": 0.27},
+        "India":  {"s1": 809_986, "s2": 2_312_565, "s3": 2_405_000, "dup": 0.37},
+        "France": {"s1": 259_452, "s2": 703_378,   "s3": 731_615,   "dup": 0.26},
+    },
 }
+COUNTRIES = SPLITS["test"]      # back-compat for callers that predate --split
 K_HIST = {0: 0.0558, 1: 0.0540, 2: 0.1700, 3: 0.2406, 4: 0.2194, 5: 0.1459, 6: 0.0747,
           7: 0.0200, 8: 0.0120, 9: 0.0076}
 CAP = {2: 5, 3: 6}
@@ -140,12 +148,16 @@ def _noisy(rng, name: str, addr: str, country: str, src: int) -> tuple[str, str]
     return name, addr
 
 
-def generate(scale: float = 0.01, seed: int = 7, k_scale: float = 1.0) -> dict:
+def generate(scale: float = 0.01, seed: int = 7, k_scale: float = 1.0,
+             split: str = "test") -> dict:
     """Build the synthetic split; returns ``{"s1", "s2", "s3", "truth"}`` frames.
 
     ``scale`` multiplies every real row count, so ``scale=0.01`` gives ~17k S1
     entities and ~100k S2/S3 records - small enough to run the whole cascade in
     a couple of minutes on two cores.
+
+    ``split`` picks the row counts: "train" is US + India at 4.68 records per S1,
+    "test" adds France at 5.75 - the same shift the real data has.
 
     ``k_scale`` resolves the open question R4 in phase0_report.md: test has 5.75
     S2/S3 records per S1 against train's 4.68, and it is not known whether the
@@ -161,7 +173,7 @@ def generate(scale: float = 0.01, seed: int = 7, k_scale: float = 1.0) -> dict:
     s1_rows, rec_rows, truth = [], {2: [], 3: []}, []
     uid = iter(range(10_000_000, 99_999_999))
 
-    for country, spec in COUNTRIES.items():
+    for country, spec in SPLITS[split].items():
         n1 = max(50, int(spec["s1"] * scale))
         # chain pressure: exactly ``dup`` of the entities reuse another's name,
         # so the realised duplicate-name rate matches the measured one
@@ -229,6 +241,28 @@ def profile(data: dict) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["metric", "value"])
 
 
+def write_dataset(data: dict, root: str, split: str) -> None:
+    """Write the split in exact challenge format, so pipeline code can be tested.
+
+    Produces ``<root>/<split>/{split}_source{1,2,3}.tsv`` and, for train, the
+    ``{split}_ground_truth.tsv`` with one row per S1 entity (empty list allowed).
+    """
+    import csv
+
+    d = os.path.join(root, split)
+    os.makedirs(d, exist_ok=True)
+    for src in (1, 2, 3):
+        data[f"s{src}" if src > 1 else "s1"].to_csv(
+            os.path.join(d, f"{split}_source{src}.tsv"), sep="\t", index=False,
+            quoting=csv.QUOTE_NONE, escapechar=None, encoding="utf-8")
+    if split == "train":
+        lists = data["truth"].groupby("s1")["rid"].agg(",".join)
+        gt = pd.DataFrame({"source1_entity_id": data["s1"]["entity_id"]})
+        gt["matched_entity_ids"] = gt["source1_entity_id"].map(lists).fillna("")
+        gt.to_csv(os.path.join(d, f"{split}_ground_truth.tsv"), sep="\t", index=False,
+                  quoting=csv.QUOTE_NONE, encoding="utf-8")
+
+
 def main() -> None:
     """CLI: write the synthetic split to ``--out`` as parquet and print a profile."""
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
@@ -237,15 +271,21 @@ def main() -> None:
     ap.add_argument("--k-scale", type=float, default=1.0,
                     help="1.0 = train k histogram (surplus becomes orphans); "
                          "1.23 = hold the 26%% orphan rate and raise k instead")
+    ap.add_argument("--split", default="test", choices=["train", "test"])
     ap.add_argument("--out", default="artifacts/sim")
+    ap.add_argument("--as-dataset", default=None, metavar="DIR",
+                    help="also write challenge-format TSVs under DIR/<split>/")
     args = ap.parse_args()
 
-    data = generate(args.scale, args.seed, args.k_scale)
+    data = generate(args.scale, args.seed, args.k_scale, args.split)
     os.makedirs(args.out, exist_ok=True)
     for name, df in data.items():
         df.to_parquet(os.path.join(args.out, f"{name}.parquet"), index=False)
     print(profile(data).to_string(index=False))
     print(f"\nwrote {args.out}")
+    if args.as_dataset:
+        write_dataset(data, args.as_dataset, args.split)
+        print(f"wrote challenge-format TSVs to {args.as_dataset}/{args.split}")
 
 
 if __name__ == "__main__":
