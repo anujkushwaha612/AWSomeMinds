@@ -1,0 +1,63 @@
+                 metric      value
+                S1 rows  6928.0000
+             S2+S3 rows 39876.0000
+         records per S1     5.7560
+               GT pairs 29232.0000
+                 mean k     4.2190
+              share k=0     0.0626
+    orphan record share     0.2669
+S1 duplicate-name share     0.3548
+          max S2 per S1     5.0000
+          max S3 per S1     6.0000
+
+probe: 911,454 raw pairs in 17s
+  index:France:NA: {'vocab_full': 3289, 'vocab_kept': 3248, 'postings_before': 42736, 'postings_after': 32346, 'max_posting_list': 204, 'df_cap': 207}
+  index:France:A: {'vocab_full': 3289, 'vocab_kept': 3248, 'postings_before': 26122, 'postings_after': 16046, 'max_posting_list': 204, 'df_cap': 207}
+  index:France:N: {'vocab_full': 3289, 'vocab_kept': 3288, 'postings_before': 16847, 'postings_after': 16626, 'max_posting_list': 170, 'df_cap': 207}
+  index:India:NA: {'vocab_full': 17499, 'vocab_kept': 17470, 'postings_before': 131662, 'postings_after': 108859, 'max_posting_list': 647, 'df_cap': 647}
+  index:India:A: {'vocab_full': 17499, 'vocab_kept': 17482, 'postings_before': 75482, 'postings_after': 61638, 'max_posting_list': 647, 'df_cap': 647}
+  index:India:N: {'vocab_full': 17499, 'vocab_kept': 17493, 'postings_before': 56847, 'postings_after': 52455, 'max_posting_list': 647, 'df_cap': 647}
+  index:US:NA: {'vocab_full': 4768, 'vocab_kept': 4712, 'postings_before': 115724, 'postings_after': 82404, 'max_posting_list': 528, 'df_cap': 530}
+  index:US:A: {'vocab_full': 4768, 'vocab_kept': 4721, 'postings_before': 73370, 'postings_after': 46789, 'max_posting_list': 528, 'df_cap': 530}
+  index:US:N: {'vocab_full': 4768, 'vocab_kept': 4767, 'postings_before': 43097, 'postings_after': 42536, 'max_posting_list': 439, 'df_cap': 530}
+
+== blocking scorecard (SYNTHETIC DATA - mechanics only, not real recall)
+                            config  oracle_f05  pairs_completeness  pairs_quality  C_per_s1_mean  C_per_s1_p90  C_per_s1_max  share_s1_empty  C_per_record_mean  RR_vs_country
+                   cascade a_max=1     0.98523             0.94893        0.72494        5.52309           9.0            13         0.02483            0.95957        0.99964
+               ablation: no rescue     0.98394             0.94099        0.48892        8.12081          13.0            13         0.00548            1.41090        0.99948
+                   cascade a_max=2     0.98394             0.94099        0.48733        8.14723          13.0            13         0.00548            1.41549        0.99948
+      ablation: no reciprocal tier     0.98394             0.94099        0.48144        8.24697          13.0            13         0.00491            1.43282        0.99947
+       ablation: no adaptive depth     0.98326             0.93866        0.43342        9.13799          13.0            13         0.00318            1.58762        0.99941
+         ablation: no capacity cap     0.98995             0.96466        0.43741        9.30543          15.0            92         0.00548            1.61671        0.99940
+                   cascade a_max=3     0.98012             0.92669        0.39940        9.78998          13.0            13         0.00188            1.70090        0.99937
+ baseline entity-side top-5/source     0.97782             0.92313        0.38951       10.00000          10.0            10         0.00000            1.73739        0.99936
+baseline entity-side top-10/source     0.98370             0.94602        0.19958       20.00000          20.0            20         0.00000            3.47477        0.99871
+baseline entity-side top-20/source     0.98800             0.95967        0.10123       40.00000          40.0            40         0.00000            6.94954        0.99742
+baseline entity-side top-50/source     0.99180             0.97232        0.04103      100.00000         100.0           100         0.00000           17.37386        0.99356
+                   raw probe union     0.99875             0.99507        0.03191      131.56091         202.0           709         0.00000           22.85721        0.99153
+
+== selection diagnostics (cascade a_max=2)
+  n_in: 911454
+  n_after_floor: 902355
+  n_out: 56444
+  records_in: 39762
+  records_confident: 13866
+  records_abstained: 5
+  records_ambiguous: 25891
+  n_rescued: 183
+  tier_counts: {0: 40034, 1: 16227, 2: 183}
+
+== per stratum (cascade a_max=2)
+       stratum    n  oracle_f05  C_per_s1
+           ALL 6928      0.9839    8.1472
+country=France 1037      0.9903    7.6181
+ country=India 3239      0.9834    8.3461
+    country=US 2652      0.9821    8.1112
+    k_bucket=0  434      1.0000    4.6774
+    k_bucket=1  361      0.9695    5.5512
+    k_bucket=2 1172      0.9787    6.4394
+    k_bucket=4 1652      0.9860    8.1344
+    k_bucket=5 1461      0.9856    8.8200
+    k_bucket=6 1848      0.9832   10.0319
+
+total 31s

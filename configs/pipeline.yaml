@@ -16,16 +16,43 @@ validation:
   report_fold: 0        # decision params tuned on the other folds, reported here
   k_buckets: [0, 1, 2, 3, 4, 5, 6]   # last bucket means ">= 6"
 
+# Candidate generation. See blocking_strategy.md for why the query side is the
+# S2/S3 record and not the S1 entity, and for the sweep order of every knob here.
 blocking:
-  # char n-gram TF-IDF, fitted per country on that country's S1+S2+S3 texts
+  # char n-gram TF-IDF over the S1 index, IDF fitted on the whole country corpus
   ngram: [3, 3]
   min_df: 2
-  max_df: 0.10          # drop n-grams in >10% of records (pvt/ltd/inc): speed, little signal
-  views: [NA, A, N]     # NA = name+address, A = address only, N = name only, T = translit [EXP]
-  k_forward: 50         # S1 -> top-k per source (stored; audit picks the K actually used)
-  k_reverse: 10         # S2/S3 -> top-k S1
+  max_df: 0.10          # kept only for the legacy ber.blocking.retrieve path
+  views: [NA, A, N]     # NA = legal-stripped name + address, A = address only, N = name only
+
+  # bounded query work (blocking_strategy.md 3.1). max_index_df > 1 is an absolute
+  # posting-list cap, <= 1 a fraction of index rows, 0 disables purging.
+  # Start absolute on the real data; 20000 on a 663k-row US S1 index is ~3%.
+  max_index_df: 20000
+  sketch_terms: 24      # score only the N rarest n-grams of each query (prefix filter)
+
+  k_forward: 10         # record -> top-k S1 candidates per view (the probe depth)
+  k_reverse: 20         # S1 -> top-k records, used ONLY for the reciprocal filter
   query_chunk: 20000
   n_threads: 0          # 0 = all cores
+
+# Stage 3 selection policy (ber.blocking.select.SelectPolicy). These defaults are
+# the documented starting point, NOT tuned numbers: conf_score / conf_margin /
+# abstain_score must be re-read off the real top-1 score histogram first.
+select:
+  score_floor: 0.10
+  a_max: 2              # max S1 candidates per S2/S3 record - the dominant size knob
+  conf_score: 0.80      # top-1 at least this strong ...
+  conf_margin: 0.15     # ... and this far ahead of top-2 -> keep only top-1
+  abstain_score: 0.20   # top-1 weaker than this -> emit nothing (~26% of records are orphans)
+  recip_r_rec: 2        # reciprocal if the record ranks the S1 this high ...
+  recip_r_ent: 10       # ... and the S1 ranks the record this high
+  one_sided_score: 0.45 # a one-sided pair needs this score ...
+  one_sided_views: 2    # ... or agreement from this many views
+  cap_s2: 6             # measured max is 5 S2 per S1 (+1 slot of slack)
+  cap_s3: 7             # measured max is 6 S3 per S1 (+1 slot of slack)
+  cap_rounds: 3
+  rescue_floor: 0.25    # floor for re-admitting the best edge of an emptied record
 
 bootstrap:
   n_resamples: 1000

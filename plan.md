@@ -81,12 +81,12 @@ So precision and the first admission (empty vs non-empty) dominate.
       │   space-stripped name · script flags · digits (house-no, postal, digit-runs)
       │   [EXP] all-Indic transliteration view
       ▼
- [2] CANDIDATE GENERATION (same-country hard filter first)
-      │   char-3g TF-IDF (max_df-pruned), top-k PER SOURCE:
-      │     name+addr (backbone)  ∪  address-only [EXP, strongly indicated]
-      │     ∪ reverse S2/S3→S1 top-k [EXP]   ∪ name-only [EXP]
-      │   plain union → per-source cap → candidate_pairs.tsv
-      │   AUDIT: oracle macro-F0.5 per stratum (post-cap), |C|, RR, runtime
+ [2] CANDIDATE GENERATION — see blocking_strategy.md (v5)
+      │   country partition → df-purged S1 index → each S2/S3 RECORD probes it
+      │   (views NA / A / N + exact keys) → adaptive depth per record →
+      │   reciprocal filter → capacity b-matching (≤5 S2, ≤6 S3 per S1) → rescue
+      │   target ~6-9 candidates per S1 (floor 4.26); hard max cap_s2 + cap_s3
+      │   AUDIT: oracle macro-F0.5 per stratum, PC, PQ, |C|/S1, |C|/record, RR, runtime
       ▼
  [3] PAIR SCORING
       │   features (no country, no target encoding) → LightGBM stage 1 (5-fold full-universe OOF)
@@ -131,7 +131,25 @@ Additive views, never destructive:
 
 All-Indic transliteration (ISO-15919-style table applied via per-block offset) is written now but used only after Step 3 shows where it helps.
 
-### Step 3 — Full-universe rank table (Day 1, the decisive recall experiment)
+### Step 3 — Candidate generation → **superseded by [blocking_strategy.md](blocking_strategy.md) (v5)**
+
+> The entity-side "top-K per S1, union every view" design below optimises the wrong
+> quantity. Because every S2/S3 record has at most one S1 parent [R], candidate generation
+> is a degree-constrained **record → entity assignment**, and its budget is candidates per
+> *record*. v5 replaces this step with a record-side cascade (df-purged bounded-work probe →
+> adaptive depth → reciprocal filter → capacity b-matching → rescue) that reaches the oracle
+> F0.5 of a top-20-per-source baseline at ~4.9× fewer candidates per S1 on the simulator.
+> The floor is **4.26 candidates per test S1** [A]; v4's K=50 sits at 100. Read v5 for the
+> arithmetic, the sweep order and gates B1–B7.
+>
+> What survives from below: the timing run (1), storing ranks/scores once so every policy
+> is evaluated offline (3), and reporting oracle macro-F0.5 rather than pair recall (4).
+> `ber.blocking.retrieve` remains the quickest way to produce that dump.
+
+<details>
+<summary>v4 text, kept for provenance</summary>
+
+#### Full-universe rank table (Day 1, the decisive recall experiment)
 1. **Timing run** on a 1% slice per view. Extrapolate before launching the full run. High-df n-grams dominate the cost, so prune them with `max_df`.
 2. On the **full train universe** (all S1 × all S2/S3, per country; India first, then US):
    - Views: NA = name+addr, A = address-only, N = name-only (T = transliterated added later if needed).
@@ -145,6 +163,8 @@ All-Indic transliteration (ISO-15919-style table applied via per-block offset) i
    - wall-clock
 5. **Selection rule:** add views greedily by oracle-F0.5 gain per unit |C|. Stop when the next gain's CI includes 0. K per source is the smallest K whose oracle F0.5 is within the CI of K_max.
 6. The same code runs on test to produce `candidate_pairs.tsv`. These tables go straight into the methodology doc's blocking-audit section [C].
+
+</details>
 
 ### Step 4 — Validation design (Day 1)
 - **5-fold entity-level cross-fitting on the full train universe.** S1 entities are stratified by country × k-bucket; a pair inherits its S1's fold. Orphans enter only as negatives, wherever they're retrieved.

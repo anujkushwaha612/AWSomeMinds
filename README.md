@@ -1,8 +1,9 @@
 # Business Entity Resolution — Amazon ML Challenge 2026
 
 Pipeline: normalization → same-country candidate generation → LightGBM pair scoring →
-entity decision layer. Strategy and gates: [plan.md](plan.md). Data findings:
-[phase0_report.md](phase0_report.md).
+entity decision layer. Strategy and gates: [plan.md](plan.md). Candidate generation
+(the part Amazon ranks separately): [blocking_strategy.md](blocking_strategy.md).
+Data findings: [phase0_report.md](phase0_report.md).
 
 ## Setup
 
@@ -24,8 +25,12 @@ All paths and numbers live in [configs/pipeline.yaml](configs/pipeline.yaml).
 ## Reproduce (stages implemented so far)
 
 ```bash
-python -m pytest                 # scorer unit tests (incl. the 0.714 worked example)
+python -m pytest                 # scorer + selection unit tests (incl. the 0.714 example)
 python -m ber.folds              # artifacts/folds.parquet: 5 entity-level folds
+
+# blocking cascade on the calibrated synthetic split (no real data needed)
+python -m phase0.simulate --scale 0.004
+python -m phase0.blocking_demo --scale 0.004 --df-sweep
 ```
 
 ## Layout
@@ -35,6 +40,9 @@ python -m ber.folds              # artifacts/folds.parquet: 5 entity-level folds
 | `src/ber/config.py` | config loading, local/S3 path helpers |
 | `src/ber/io.py` | TSV readers (strings, no NA conversion), parquet cache, submission writer |
 | `src/ber/eval/scorer.py` | exact per-entity F0.5 scorer, oracle ceiling, paired bootstrap, strata summary |
+| `src/ber/blocking/probe.py` | df-purged S1 index, query sketch, bounded-work record→S1 top-k |
+| `src/ber/blocking/select.py` | adaptive depth, reciprocal filter, capacity b-matching, rescue |
+| `src/ber/blocking/metrics.py` | blocking scorecard: oracle F0.5, PC, PQ, \|C\|/S1, RR, operating point |
 | `src/ber/folds.py` | fold assignment stratified by country x k-bucket |
 | `src/ber/submit.py` | write both TSVs, run the official validator, snapshot to `subs/<name>/` |
 | `phase0/` | data-analysis scripts behind phase0_report.md §8 |
