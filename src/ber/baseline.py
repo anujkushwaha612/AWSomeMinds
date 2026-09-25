@@ -64,8 +64,17 @@ def cfg() -> dict:
 
 
 def run_path(*parts: str) -> str:
-    """Path under ``artifacts/<run_name>/`` (separate run names keep experiments apart)."""
+    """Models / OOF / metrics / log of this run: ``artifacts/<BER_RUN>/`` (default ``baseline``)."""
     return artifact_path(os.environ.get("BER_RUN", cfg().get("run_name", "baseline")), *parts)
+
+
+def feature_path(*parts: str) -> str:
+    """Candidates + features: ``artifacts/<BER_FEATURES>/`` (defaults to the run folder).
+
+    Lets a model experiment (new ``BER_RUN``) reuse features built once by another run.
+    """
+    run = os.environ.get("BER_FEATURES") or os.environ.get("BER_RUN", cfg().get("run_name", "baseline"))
+    return artifact_path(run, *parts)
 
 
 def setup_logging() -> None:
@@ -86,7 +95,7 @@ def entity_key(country, s1_row) -> np.ndarray:
 
 def feature_batches(split: str, country: str, columns, batch: int):
     """Stream ``columns`` of a country's feature file as NumPy float32 matrices."""
-    pf = pq.ParquetFile(run_path(split, f"{country}.parquet"))
+    pf = pq.ParquetFile(feature_path(split, f"{country}.parquet"))
     for rb in pf.iter_batches(batch_size=batch, columns=list(columns)):
         yield np.column_stack([rb.column(i).to_numpy(zero_copy_only=False).astype(np.float32)
                                for i in range(rb.num_columns)])
@@ -97,9 +106,9 @@ def read_keys(split: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     keys, ents = [], []
     cols = KEY_COLS + (["label"] if split == "train" else [])
     for code, country in enumerate(split_countries(split)):
-        k = pq.read_table(run_path(split, f"{country}.parquet"), columns=cols).to_pandas()
+        k = pq.read_table(feature_path(split, f"{country}.parquet"), columns=cols).to_pandas()
         k["country"] = np.int8(code)
-        e = pd.read_parquet(run_path(split, f"{country}_entities.parquet"))
+        e = pd.read_parquet(feature_path(split, f"{country}_entities.parquet"))
         e["country"] = np.int8(code)
         e["country_name"] = country
         keys.append(k)
@@ -132,8 +141,8 @@ def build(split: str, limit: int | None = None, force: bool = False) -> None:
     folds = pd.read_parquet(artifact_path("folds.parquet")) if split == "train" else None
     with ProcessPoolExecutor(max_workers=c["workers"]) as pool:
         for country in split_countries(split):
-            out = run_path(split, f"{country}.parquet")
-            ents_out = run_path(split, f"{country}_entities.parquet")
+            out = feature_path(split, f"{country}.parquet")
+            ents_out = feature_path(split, f"{country}_entities.parquet")
             if os.path.exists(out) and os.path.exists(ents_out) and not force:
                 log.info(f"[build {split}/{country}] exists, skipping")
                 continue
@@ -258,9 +267,22 @@ def tune(dec: Decider, scorer: EntityScorer) -> dict:
 
 
 # ------------------------------------------------------------------ train
-def train() -> None:
-    """Cross-fitted LightGBM (entity-sampled training, streamed OOF), tuning, report."""
-    c, v = cfg(), load_config()["validation"]
+def train(overrides: dict | None = None) -> None:
+    """Cross-fitted LightGBM (entity-sampled training, streamed OOF), tuning, report.
+
+    ``overrides`` replaces baseline config keys for this run (``train_frac``, and
+    LightGBM keys under ``lgb``); they are recorded in metrics.json.
+    """
+    c = dict(cfg())
+    c["lgb"] = dict(c["lgb"])
+    for k, val in (overrides or {}).items():
+        if val is None:
+            continue
+        if k in c["lgb"]:
+            c["lgb"][k] = val
+        else:
+            c[k] = val
+    v = load_config()["validation"]
     keys, ents = read_keys("train")
     names = split_countries("train")
     log.info(f"[train] {len(keys):,} pairs, {len(ents):,} entities, "
@@ -280,15 +302,18 @@ def train() -> None:
         pair_samp[pm] = e_u[rows] < c["train_frac"]
     y_all = keys["label"].to_numpy()
 
-    # sample pass: read features of sampled entities only
-    X_parts, offset = [], 0
+    # sample pass: read features of sampled entities only, into one preallocated matrix
+    # (no list-of-batches + concatenate, which would briefly hold two copies)
+    n_samp = int(pair_samp.sum())
+    Xs = np.empty((n_samp, len(FEATURES)), dtype=np.float32)
+    offset = filled = 0
     for code, country in enumerate(names):
         for X in feature_batches("train", country, FEATURES, c["predict_batch"]):
             sel = pair_samp[offset:offset + len(X)]
-            X_parts.append(X[sel])
+            n = int(sel.sum())
+            Xs[filled:filled + n] = X[sel]
+            filled += n
             offset += len(X)
-    Xs = np.concatenate(X_parts)
-    del X_parts
     ys, fs = y_all[pair_samp], pair_fold[pair_samp]
     log.info(f"[train] training sample: {len(Xs):,} pairs ({c['train_frac']:.0%} of entities, "
              f"all their candidates; {int(ys.sum()):,} positives), "
@@ -297,25 +322,31 @@ def train() -> None:
     params = {"objective": "binary", "verbosity": -1, "num_threads": os.cpu_count(),
               "seed": load_config()["seed"], **{k: v_ for k, v_ in c["lgb"].items()
                                                   if k not in ("num_rounds", "early_stopping")}}
+    # Bin the sample once, free the float matrix, and cut each fold's train / early-stop
+    # sets as subsets of the binned data (no per-fold copies of the raw features).
+    t = time.time()
+    full = lgb.Dataset(Xs, ys, feature_name=FEATURES, params=params, free_raw_data=True)
+    full.construct()
+    del Xs
+    gc.collect()
+    log.info(f"[train] binned training data in {time.time() - t:.0f}s {mem_str()}")
     model_dir = run_path("models")
     os.makedirs(model_dir, exist_ok=True)
-    es_u = np.random.default_rng(load_config()["seed"] + 1).random(len(Xs))
+    es_u = np.random.default_rng(load_config()["seed"] + 1).random(len(ys))
     boosters = []
     for f in range(v["n_folds"]):
         t = time.time()
         tr = fs != f
         es = tr & (es_u < 0.1)                       # 10% of the sample for early stopping
         fit = tr & ~es
-        booster = lgb.train(params, lgb.Dataset(Xs[fit], ys[fit], feature_name=FEATURES,
-                                                free_raw_data=True),
-                            c["lgb"]["num_rounds"],
-                            valid_sets=[lgb.Dataset(Xs[es], ys[es], feature_name=FEATURES)],
+        booster = lgb.train(params, full.subset(np.flatnonzero(fit)), c["lgb"]["num_rounds"],
+                            valid_sets=[full.subset(np.flatnonzero(es))],
                             callbacks=[lgb.early_stopping(c["lgb"]["early_stopping"], verbose=False)])
         booster.save_model(os.path.join(model_dir, f"fold{f}.txt"))
         boosters.append(booster)
         log.info(f"[train] fold {f}: {int(fit.sum()):,} rows, {booster.best_iteration} trees, "
                  f"{time.time() - t:.0f}s {mem_str()}")
-    del Xs, ys, fs, es_u
+    del full, ys, fs, es_u
     gc.collect()
 
     # streamed out-of-fold prediction for every pair
@@ -446,6 +477,49 @@ def predict(name: str) -> None:
                         notes="baseline: word1+2 TF-IDF record-side top-k, LightGBM, D2 + arbitration")
 
 
+def compare(run_a: str, run_b: str) -> None:
+    """Paired-bootstrap comparison of two runs on the same fold-0 entities.
+
+    Both runs must share the feature files (same candidates, same row order).
+    Each run is scored with its own tuned decision rule, as it would be submitted.
+    """
+    from .eval.scorer import paired_bootstrap
+
+    keys, ents = read_keys("train")
+    v, boot = load_config()["validation"], load_config()["bootstrap"]
+    rep_mask = (ents["fold"] == v["report_fold"]).to_numpy()
+    scorer = EntityScorer(ents, keys, rep_mask)
+    per, summary = {}, {}
+    for run in (run_a, run_b):
+        base = artifact_path(run)
+        oof = np.load(os.path.join(base, "oof.npy"))
+        with open(os.path.join(base, "metrics.json"), encoding="utf-8") as fh:
+            m = json.load(fh)
+        d = m["decision"]
+        per[run] = scorer.per_entity(Decider(keys, oof).keep(d["t_first"], d["t_rest"], d["arbitrate"]))
+        summary[run] = {"macro_f05": float(per[run].mean()), "t_first": d["t_first"],
+                        "t_rest": d["t_rest"], "train_frac": m["config"]["train_frac"]}
+    bs = paired_bootstrap(per[run_a], per[run_b], boot["n_resamples"], boot["alpha"])
+    rep_ents = ents[rep_mask]
+    by_country = {n: float(per[run_b][(rep_ents["country_name"] == n).to_numpy()].mean()
+                           - per[run_a][(rep_ents["country_name"] == n).to_numpy()].mean())
+                  for n in rep_ents["country_name"].unique()}
+    kb = k_bucket(rep_ents["k"])
+    by_k = {int(b): float(per[run_b][kb == b].mean() - per[run_a][kb == b].mean()) for b in np.unique(kb)}
+    material = bs["ci_low"] > 0 and bs["delta"] >= boot["materiality"]
+    verdict = ("KEEP (better, CI > 0 and >= materiality)" if material
+               else "WORSE (CI < 0)" if bs["ci_high"] < 0 else "NO CLEAR DIFFERENCE (keep simpler run)")
+    out = {"a": summary[run_a], "b": summary[run_b], "delta": bs, "delta_by_country": by_country,
+           "delta_by_k": by_k, "verdict": verdict}
+    with open(os.path.join(artifact_path(run_b), f"compare_vs_{run_a}.json"), "w", encoding="utf-8") as fh:
+        json.dump(out, fh, indent=2)
+    log.info(f"[compare] {run_a}: {summary[run_a]['macro_f05']:.5f}   {run_b}: {summary[run_b]['macro_f05']:.5f}")
+    log.info(f"[compare] delta {bs['delta']:+.5f}  95% CI [{bs['ci_low']:+.5f}, {bs['ci_high']:+.5f}]  "
+             f"on {bs['n_entities']:,} fold-0 entities -> {verdict}")
+    log.info(f"[compare] delta by country {json.dumps({k: round(x, 5) for k, x in by_country.items()})}")
+    log.info(f"[compare] delta by k {json.dumps({k: round(x, 5) for k, x in by_k.items()})}")
+
+
 def main() -> None:
     """CLI entry point."""
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
@@ -454,15 +528,27 @@ def main() -> None:
     b.add_argument("--split", required=True, choices=["train", "test"])
     b.add_argument("--limit", type=int, default=None, help="rows per source per country (smoke tests)")
     b.add_argument("--force", action="store_true")
-    sub.add_parser("train")
+    t = sub.add_parser("train")
+    t.add_argument("--train-frac", type=float, default=None, help="share of entities to train on")
+    t.add_argument("--num-leaves", type=int, default=None)
+    t.add_argument("--learning-rate", type=float, default=None)
+    t.add_argument("--num-rounds", type=int, default=None)
+    t.add_argument("--min-data-in-leaf", type=int, default=None)
     p = sub.add_parser("predict")
     p.add_argument("--name", required=True)
+    cmp_ = sub.add_parser("compare")
+    cmp_.add_argument("run_a")
+    cmp_.add_argument("run_b")
     args = ap.parse_args()
     setup_logging()
     if args.cmd == "build":
         build(args.split, args.limit, args.force)
     elif args.cmd == "train":
-        train()
+        train({"train_frac": args.train_frac, "num_leaves": args.num_leaves,
+               "learning_rate": args.learning_rate, "num_rounds": args.num_rounds,
+               "min_data_in_leaf": args.min_data_in_leaf})
+    elif args.cmd == "compare":
+        compare(args.run_a, args.run_b)
     else:
         predict(args.name)
 

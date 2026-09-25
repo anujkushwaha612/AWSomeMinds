@@ -1,0 +1,100 @@
+{
+  "name": "sub01_baseline",
+  "created_utc": "2026-09-25T20:59:38+00:00",
+  "commit": "f63b50b5a8f17197144939c4b5e55b49dbb8e567-dirty",
+  "config": {
+    "data_root": "data/dataset",
+    "artifacts_root": "artifacts",
+    "seed": 2026,
+    "validation": {
+      "n_folds": 5,
+      "report_fold": 0,
+      "k_buckets": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ]
+    },
+    "blocking": {
+      "ngram": [
+        3,
+        3
+      ],
+      "min_df": 2,
+      "max_df": 0.1,
+      "views": [
+        "NA",
+        "A",
+        "N"
+      ],
+      "k_forward": 50,
+      "k_reverse": 10,
+      "query_chunk": 20000,
+      "n_threads": 0
+    },
+    "baseline": {
+      "k_rec": 3,
+      "max_df": 0.01,
+      "min_score": 0.0,
+      "workers": 8,
+      "chunk": 50000,
+      "window": 16,
+      "feature_chunk": 500000,
+      "predict_batch": 1000000,
+      "train_frac": 0.3,
+      "lgb": {
+        "learning_rate": 0.1,
+        "num_leaves": 63,
+        "min_data_in_leaf": 200,
+        "feature_fraction": 0.9,
+        "bagging_fraction": 0.8,
+        "bagging_freq": 1,
+        "num_rounds": 400,
+        "early_stopping": 30
+      },
+      "grid": [
+        0.1,
+        0.95,
+        0.05
+      ]
+    },
+    "bootstrap": {
+      "n_resamples": 1000,
+      "alpha": 0.05,
+      "materiality": 0.002
+    }
+  },
+  "offline_metrics": {
+    "macro_f05": 0.9486682083316607,
+    "oracle_f05_candidates": 0.9848115638976785,
+    "mean_candidates_per_s1": 14.013686929333666,
+    "per_country": {
+      "India": 0.9399657833889188,
+      "US": 0.9544748654611357
+    },
+    "decision": {
+      "f05": 0.9481904645086578,
+      "t_first": 0.65,
+      "t_rest": 0.65,
+      "arbitrate": true,
+      "reference": {
+        "global_T_arbitrated": {
+          "f05": 0.9481904645086578,
+          "T": 0.65
+        },
+        "global_T_no_arbitration": {
+          "f05": 0.947292962592293,
+          "T": 0.65
+        }
+      }
+    }
+  },
+  "n_match_pairs": 5537986,
+  "n_candidate_pairs": 29899751,
+  "leaderboard_score": null,
+  "notes": "baseline: word1+2 TF-IDF record-side top-k, LightGBM, D2 + arbitration"
+}

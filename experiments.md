@@ -207,3 +207,54 @@ slice is mostly singletons).
 
 **Verdict.** KEEP the lean pipeline. Full-scale memory and timings are still to be measured on the
 first real run and recorded here.
+
+**Full-scale run (2026-09-26, laptop):** total ~2 h 15 min; peak main-process memory 4.79 GB (train
+build, US). Train: 30.96M pairs (14.0/S1), pair recall India 0.939 / US 0.969. Test: 29.9M pairs
+(17.3/S1). Fold-0 macro F0.5 **0.9487** (oracle 0.9848). **Public LB (Sub #1): 0.938.**
+LB top 3 at submission time: 0.988419 / 0.988095 / 0.987916.
+
+---
+
+## E2 — Error analysis of the baseline: where are the 0.05 lost? (2026-09-26)
+
+**Row-order leak check (none).** Pearson(row position of S1, row position of partner) = 0.001 (S2) /
+−0.0007 (S3); share with |Δ position| < 1% = 0.0199 / 0.0198 (random 0.02); GT file order vs S1 order
+0.0003; S2 siblings of one entity are spread across the file like random rows. The data carries no
+positional shortcut: the leaderboard gap is methodological.
+
+**Loss decomposition (fold 0, 441,370 entities).** "Without FPs" keeps the same true positives and removes
+every false positive; "oracle" = every retrieved true pair, no false positives.
+
+| | Macro F0.5 | Loss |
+|---|---|---|
+| Actual | 0.9487 | – |
+| Without false positives | 0.9634 | **FP: 0.0148** |
+| Oracle (all retrieved true pairs) | 0.9848 | **found but rejected: 0.0214** |
+| Perfect | 1.0 | **never retrieved: 0.0152** |
+
+By k (loss × share of entities): FP loss concentrates on k=0 singletons (0.0044) and k=2–3; the
+"rejected" and "missed" losses spread over k=1–6.
+
+**Profile of never-retrieved true pairs (fold 0)**
+
+| Country / source | Missed | Indic-script name | Empty address | Parent's name shared by >1 S1 (vs all pairs) |
+|---|---|---|---|---|
+| India S2 | 5.66% | 63.0% | 22.5% | 71.1% (44.4%) |
+| India S3 | 6.54% | 29.5% | 24.4% | 65.3% (44.1%) |
+| US S2 | 3.37% | 0% | 46.5% | 50.9% (35.8%) |
+| US S3 | 2.94% | 0% | 49.4% | 51.8% (35.8%) |
+
+Typical misses (examples printed by the script):
+- (a) empty or near-empty address plus a name typo ("ferrari bl0ck company", "dermatology anfcor group");
+- (b) Indic-script name with a short address ("कृष्णा बिजनेस प्राइवेट लिमिटेड | s no 861 nashik महाराष्ट्र");
+- (c) domain-style names ("lvassignments com", "halldennis com");
+- (d) chain names (a shared name plus a weak address);
+- (e) garbled names ("vioaria").
+
+Word 1+2-gram tokens can't match (a), (b) or (c) at the character level.
+
+**Verdict.** The model side (FP 0.0148 + rejected 0.0214 = 0.036) is larger than retrieval (0.015),
+and even the oracle ceiling (0.985) is below the LB top (0.988). Both sides must improve. Next
+experiments: E3 (stronger model: all entities, more capacity), E4 (stage-2 competition / sibling
+features), E5 (second-pass char-level retrieval only for hard records).
+Script: [experiments/e2_error_analysis.py](experiments/e2_error_analysis.py).
