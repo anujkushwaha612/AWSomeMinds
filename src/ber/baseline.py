@@ -343,7 +343,9 @@ def train(overrides: dict | None = None) -> None:
                             valid_sets=[full.subset(np.flatnonzero(es))],
                             callbacks=[lgb.early_stopping(c["lgb"]["early_stopping"], verbose=False)])
         booster.save_model(os.path.join(model_dir, f"fold{f}.txt"))
+        booster.free_dataset()          # the booster keeps its training subset alive otherwise
         boosters.append(booster)
+        gc.collect()
         log.info(f"[train] fold {f}: {int(fit.sum()):,} rows, {booster.best_iteration} trees, "
                  f"{time.time() - t:.0f}s {mem_str()}")
     del full, ys, fs, es_u

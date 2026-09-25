@@ -1,0 +1,86 @@
+"""Strategy v5 pieces that run on CPU: union merge, stage-2 features, expected-F rule, tiling."""
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from ber.neural.common import length_order, make_texts, tile_rows
+from ber.neural.train_biencoder import make_batches
+from ber.union import ABSENT_RANK, dense_group_features, merge_candidates, pair_key
+from ber.v5 import expected_f_keep, group_stats, stage2_features
+
+
+def test_pair_key_roundtrip_and_bounds():
+    k = pair_key(np.array([2, 3]), np.array([5, (1 << 22) - 1]), np.array([7, (1 << 21) - 1]))
+    assert (k >> 43).tolist() == [2, 3]
+    assert ((k >> 21) & ((1 << 22) - 1)).tolist() == [5, (1 << 22) - 1]
+    assert (k & ((1 << 21) - 1)).tolist() == [7, (1 << 21) - 1]
+    with pytest.raises(ValueError):
+        pair_key(np.array([2]), np.array([0]), np.array([1 << 21]))
+
+
+def test_merge_candidates_union_and_defaults():
+    tf = pd.DataFrame({"src": [2, 2], "doc_row": [0, 1], "s1_row": [10, 11],
+                       "score": [0.9, 0.4], "rank": [0, 0]})
+    tf_cos = np.array([0.8, 0.3], dtype=np.float32)
+    dense = pd.DataFrame({"src": [2, 3], "doc_row": [0, 4], "s1_row": [10, 12],
+                          "cos": [0.81, 0.7], "drank_rec": [0, -1], "drank_s1": [-1, 2]})
+    m = merge_candidates(tf, tf_cos, dense)
+    assert len(m) == 3                                      # (2,0,10) shared, (2,1,11) tfidf, (3,4,12) dense
+    row = m[(m.src == 2) & (m.doc_row == 0)].iloc[0]
+    assert row.in_tfidf == 1 and row.in_dense == 1 and row.n_retrievers == 2
+    assert row.cos == pytest.approx(0.8)                    # TF-IDF row keeps its own cosine
+    d = m[m.src == 3].iloc[0]
+    assert d.in_tfidf == 0 and d.score == 0 and d["rank"] == ABSENT_RANK
+    assert d.drank_rec == ABSENT_RANK and d.drank_s1 == 2 and d.cos == pytest.approx(0.7)
+    assert m["src"].is_monotonic_increasing                 # write_features requires src order
+    g = dense_group_features(m.copy())
+    assert g.loc[g.doc_row == 0, "dgap_rec"].iloc[0] == 0
+
+
+def test_group_stats():
+    key = np.array([1, 1, 1, 2])
+    p = np.array([0.2, 0.9, 0.5, 0.4])
+    s = group_stats(key, p, extra=(p > 0.3).astype(float))
+    assert s["rank"].tolist() == [2, 0, 1, 0]
+    assert s["max"].tolist() == [0.9, 0.9, 0.9, 0.4]
+    assert s["second"].tolist() == [0.5, 0.5, 0.5, 0.0]
+    assert s["n"].tolist() == [3, 3, 3, 1]
+    assert s["extra_sum"].tolist() == [2, 2, 2, 1]
+
+
+def test_stage2_features_margins_and_counts():
+    # record (src2, doc0) has two S1 candidates; S1 row 1 also claims doc1 (src2) and doc0 (src3)
+    keys = pd.DataFrame({"country": [0, 0, 0, 0], "src": [2, 2, 2, 3], "doc_row": [0, 0, 1, 0],
+                         "s1_row": [0, 1, 1, 1]})
+    p = np.array([0.3, 0.8, 0.6, 0.7])
+    f = stage2_features(keys, p)
+    np.testing.assert_allclose(f["p_minus_rec_other"], [-0.5, 0.5, 0.6, 0.7], atol=1e-6)
+    assert f["s1src_n05"].tolist() == [0, 2, 2, 1]
+    assert f["s1_n05"].tolist() == [0, 3, 3, 3]
+    np.testing.assert_allclose(f["s1_pmax_other_src"], [0.0, 0.7, 0.7, 0.8], atol=1e-6)
+    assert f["s1_n_best"].tolist() == [0, 3, 3, 3]          # best S1 of all three records
+
+
+def test_expected_f_keep():
+    keys = pd.DataFrame({"country": [0] * 5, "s1_row": [0, 0, 0, 1, 2]})
+    rec_best = np.ones(5, dtype=bool)
+    q = np.array([0.99, 0.95, 0.05, 0.02, 0.9])
+    keep = expected_f_keep(keys, q, rec_best)
+    # entity 0: keep the two confident candidates, not the 0.05 one; entity 1: empty is better
+    assert keep.tolist() == [True, True, False, False, True]
+
+
+def test_tile_rows_and_text_helpers():
+    assert tile_rows(1_000_000, 2.0) == 1000
+    assert tile_rows(10, 2.0) == 16384 and tile_rows(10**12, 1.0) == 64
+    assert make_texts(["a b"], [""]) == ["query: a b | "]
+    assert length_order(["ccc", "a", "bb"]).tolist() == [1, 2, 0]
+
+
+def test_make_batches_same_country():
+    pairs = pd.DataFrame({"country": [0] * 5 + [1] * 5})
+    b = make_batches(pairs, 2, True, 0)
+    assert len(b) == 4                                      # full batches only (2 + 2)
+    for idx in b:
+        assert len(set(pairs["country"].to_numpy()[idx])) == 1

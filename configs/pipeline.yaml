@@ -48,7 +48,47 @@ baseline:
     bagging_freq: 1
     num_rounds: 400
     early_stopping: 30
+    force_col_wise: true    # no row-wise copy of the binned data (memory); no effect on accuracy
   grid: [0.10, 0.95, 0.05]   # T_first / T_rest search grid: [low, high, step]
+
+v5:
+  # strategy_v5.md: A (bi-encoder) + B (union GBDT, stage 2, pruning) + C (LB gap).
+  # Every value below is justified by a measurement in experiments.md E4 (or marked [L]/[J]).
+  tfidf_run: baseline         # existing TF-IDF candidates/features in artifacts/baseline
+  encoder_folds: [3, 4]       # leakage rule: encoder trains only on these entities
+  gbdt_folds: [0, 1, 2]       # GBDT cross-fitted here; decision tuned on 1-2, reported on 0
+  report_fold: 0
+  neural:
+    model: intfloat/multilingual-e5-base   # MIT per model card; xlm-r tokenizer covers all Indic blocks
+    max_len: 64               # E4: p99 tokens <= 56 everywhere, > 64 in < 0.05% of texts
+    n_pairs: 0                # 0 = all folds-3/4 positives (E4: 3.06M); set lower if the probe is slow
+    batch_size: 256           # [L] in-batch negatives: larger is better up to memory
+    same_country_batches: true  # E4: 36-44% of parents share their name with another S1 -> hard in-batch
+    lr: 2.0e-5                # [L] standard for fine-tuning e5-base
+    warmup: 0.05
+    epochs: 1                 # 3M pairs; one pass is enough to fit the generator's noise [J]
+    scale: 20.0               # [L] e5 / MultipleNegativesRanking temperature 0.05
+    eval_records: 20000       # per country, fold-0 records: recall gate
+    encode_batch: 512
+    k_rec: 3                  # E4: TF-IDF finds 97-98% of found parents at rank 0; ranks 1-2 add 2-3 pp
+    k_s1: 5                   # E4: S1-side list per source; per-source true matches <= 5 for 100% (S2) / 99.9% (S3)
+    tile_gb: 6.0              # similarity tile size on the GPU
+  drop_encoder_records: false # true = remove encoder-seen records from the train GBDT universe (leakage check fallback)
+  prune_tau: 0.003            # E4: 14.0 -> 5.05 candidates/S1 at oracle loss 0.00004
+  train_frac: 1.0             # share of gbdt-fold entities per fold model (60% of all entities in total)
+  max_train_rows: 20000000    # memory cap for stage 1 on 15.7 GB RAM (~3 GB float32 at 37 features)
+  lgb:
+    learning_rate: 0.05       # E4: early stopping hit at 114-217 trees at lr 0.1 -> signal-limited; lower lr, more rounds [L]
+    num_leaves: 127
+    min_data_in_leaf: 200
+    feature_fraction: 0.9
+    bagging_fraction: 0.8
+    bagging_freq: 1
+    num_rounds: 3000
+    early_stopping: 50
+    force_col_wise: true
+  grid: [0.10, 0.95, 0.05]
+  stress_fraction: 0.19       # E4: S1 share to remove so train density = test density (India 0.196, US 0.188)
 
 bootstrap:
   n_resamples: 1000

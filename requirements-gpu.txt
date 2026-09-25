@@ -1,0 +1,13 @@
+# Extra packages for part A (bi-encoder) on the GPU machine, on top of requirements.txt.
+# Install PyTorch FIRST with the wheel matching the driver's CUDA version (see `nvidia-smi`):
+#   CUDA 12.4+ driver:  pip install torch --index-url https://download.pytorch.org/whl/cu124
+#   CUDA 12.1 driver:   pip install torch --index-url https://download.pytorch.org/whl/cu121
+# then:  pip install -r requirements-gpu.txt
+#
+# Model used: intfloat/multilingual-e5-base (278M parameters, MIT licence on its model card),
+# downloaded from the Hugging Face hub on first use (~1.1 GB).
+transformers>=4.44,<5
+tokenizers>=0.19
+safetensors>=0.4
+huggingface_hub>=0.23
+sentencepiece>=0.2

@@ -258,3 +258,61 @@ and even the oracle ceiling (0.985) is below the LB top (0.988). Both sides must
 experiments: E3 (stronger model: all entities, more capacity), E4 (stage-2 competition / sibling
 features), E5 (second-pass char-level retrieval only for hard records).
 Script: [experiments/e2_error_analysis.py](experiments/e2_error_analysis.py).
+
+---
+
+## E4 — Measurements that set the v5 hyperparameters (2026-09-26)
+
+Script: [experiments/e4_hparam_evidence.py](experiments/e4_hparam_evidence.py) (read-only over baseline
+artifacts; raw numbers in `artifacts/experiments/E4_evidence.json`). The token-length check used the
+`intfloat/multilingual-e5-base` tokenizer on 20k sampled texts per country × source.
+
+**TF-IDF record-side rank of the true parent (all train pairs)**
+
+| | India | US |
+|---|---|---|
+| recall@1 / @2 / @3 | 0.9087 / 0.9301 / 0.9388 | 0.9478 / 0.9624 / 0.9688 |
+| share of found parents at rank 0 | 0.968 | 0.978 |
+
+**Anatomy of fold-0 errors (baseline, T = 0.65, arbitration)**: of 1,461,618 retrieved true pairs,
+94.04% kept, **5.31% rejected with p < T** although they won arbitration, 0.65% lost arbitration.
+Of 24,109 false positives, **72.2% are orphan records** (no parent anywhere), 19.2% have their true parent
+among their candidates, 8.6% have a parent that was not retrieved.
+
+**Pruning by stage-1 p (fold 0)**
+
+| τ | oracle F0.5 | candidates / S1 | true pairs lost |
+|---|---|---|---|
+| 0 | 0.98481 | 14.01 | 0 |
+| 0.001 | 0.98479 | 5.58 | 0.006% |
+| **0.003** | **0.98477** | **5.05** | 0.011% |
+| 0.01 | 0.98468 | 4.61 | 0.044% |
+| 0.1 | 0.98238 | 3.76 | 0.75% |
+
+Positive p quantiles: 1% of true pairs have p < 0.127, 5% < 0.556. Negatives: median 0.000, q90 0.020,
+q99 0.467.
+
+**Density (S2+S3 per S1):** train 4.680 (India) / 4.674 (US); test 5.824 / 5.756 / France 5.531 →
+S1 share to remove for matching density: 0.196 / 0.188.
+
+**Encoder data (folds 3–4 positives):** India S2 592,188 (23.2% Indic), S3 631,602 (13.1%); US S2 886,043,
+S3 945,493; parents sharing their name with another S1: 44% India, 36% US; records with a non-parent
+TF-IDF candidate ranked above the parent: 8.4% / 9.9% (India), 5.6% / 4.8% (US).
+
+**Tokens (e5 tokenizer, "query: name | address")**: p50/p95/p99/max = India S2 33/46/52/72,
+S3 30/44/50/76, S1 33/44/49/68; US S2 23/29/31/38, S3 25/31/34/42, S1 23/28/31/38. Share > 64 tokens
+≤ 0.04%.
+
+**Baseline LightGBM**: trees per fold 201/114/217/163/156 (early stopping at lr 0.1); gain share
+name_len_ratio 0.234, translit_ratio 0.134, gap_rec 0.111, gap_s1 0.080, n_cand_s1 0.076, score 0.067;
+near zero: n_digits_s1, nospace_ratio, house_state, n_digits_rec, rec_addr_empty, rec_indic, src, n_cand_rec.
+
+**Verdict.** These set every v5 default (strategy_v5.md §7): max_len 64, all 3.06M pairs, fold-3/4-only
+hard negatives, same-country batches, k_rec 3, k_s1 5, prune τ 0.003, stress fraction 0.19, and stage-2
+features aimed at orphan false positives. None of the resulting gains is measured yet; that happens on
+the GPU machine run.
+
+Also recorded: PyTorch cannot load on the laptop (Smart App Control blocks `c10.dll`), so the neural
+code was verified only for its CPU parts (smoke run of pairs → union → stage 1 → stage 2 → compare →
+gap on a 20k-row slice with fake dense outputs; leakage checks passed: positives and hard negatives only
+from fold-3/4 S1s, evaluation records only fold 0).
