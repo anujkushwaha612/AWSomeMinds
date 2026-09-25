@@ -32,8 +32,11 @@ baseline:
   k_rec: 3              # top-k S1 per S2/S3 record (candidate set = k_rec x records)
   max_df: 0.01          # block purging: drop n-grams in >1% of the country's records
   min_score: 0.0        # cosine floor for a candidate
-  workers: 8            # featurization processes (memory-bound; 8 fits in 16 GB)
-  chunk: 50000          # rows per vectorization / search chunk
+  workers: 8            # hashing processes (Python-level work); see experiments.md for the sweep
+  chunk: 50000          # rows per hashing / search chunk
+  window: 16            # max hashed chunks in flight (bounds memory: ~2 x workers)
+  feature_chunk: 500000 # candidate pairs per string-feature chunk
+  predict_batch: 1000000  # feature rows per parquet read / prediction batch
   # model
   train_frac: 0.3       # share of training-fold entities (all their pairs) used per fold model
   lgb:

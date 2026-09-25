@@ -4,15 +4,21 @@ Three groups, all computed identically on train and test and never from labels:
   retrieval  - TF-IDF score, record-side rank / gap to the record's best S1,
                S1-side rank / gap within the same source, candidate counts
   string     - rapidfuzz similarities on name / legal-stripped name / no-space
-               name / transliterated name / address (vectorized, all cores)
+               name / transliterated name / address (vectorized, native threads)
   structure  - address digit overlap, house-number agreement, script flag,
                missing address, length ratio, source
 
 No country feature: France is unseen in training (plan.md §1).
+
+Memory-lean: retrieval features are computed on the compact candidate arrays;
+string features run chunk by chunk (text looked up from the Arrow store for
+that chunk only) and every chunk is appended to a parquet file.
 """
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 from rapidfuzz import fuzz, process
 from rapidfuzz.distance import JaroWinkler
 
@@ -23,6 +29,7 @@ FEATURES = [
     "digit_jacc", "house_state", "n_digits_s1", "n_digits_rec",
     "src", "rec_indic", "rec_addr_empty", "name_len_ratio", "addr_len_ratio",
 ]
+KEY_COLS = ["src", "doc_row", "s1_row"]
 
 
 def _sim(a, b, scorer) -> np.ndarray:
@@ -47,47 +54,86 @@ def _digit_features(a: list[str], b: list[str]):
     return jacc, house, na, nb
 
 
+def _len_ratio(a: list[str], b: list[str]) -> np.ndarray:
+    la = np.fromiter((len(x) for x in a), dtype=np.int32, count=len(a))
+    lb = np.fromiter((len(x) for x in b), dtype=np.int32, count=len(b))
+    return (np.minimum(la, lb) / np.maximum(np.maximum(la, lb), 1)).astype(np.float32)
+
+
 def retrieval_features(cand: pd.DataFrame) -> pd.DataFrame:
-    """Add record-side and S1-side retrieval features to one country's candidates."""
-    rec = cand.groupby(["src", "doc_row"])["score"]
+    """Add record-side and S1-side retrieval features (numeric columns only)."""
+    rec = cand.groupby(["src", "doc_row"], sort=False)["score"]
     cand["gap_rec"] = (rec.transform("max") - cand["score"]).astype(np.float32)
     cand["n_cand_rec"] = rec.transform("size").astype(np.int16)
-    s1src = cand.groupby(["s1_row", "src"])["score"]
+    s1src = cand.groupby(["s1_row", "src"], sort=False)["score"]
     cand["rank_s1"] = (s1src.rank(ascending=False, method="first") - 1).astype(np.int16)
     cand["gap_s1"] = (s1src.transform("max") - cand["score"]).astype(np.float32)
     cand["n_cand_s1_src"] = s1src.transform("size").astype(np.int16)
-    cand["n_cand_s1"] = cand.groupby("s1_row")["score"].transform("size").astype(np.int16)
+    cand["n_cand_s1"] = cand.groupby("s1_row", sort=False)["score"].transform("size").astype(np.int16)
     return cand
 
 
-def string_features(cand: pd.DataFrame, s1: pd.DataFrame, docs: dict) -> pd.DataFrame:
-    """Add string/structure features. ``s1``/``docs[src]`` are normalized tables."""
-    out = []
-    for src in (2, 3):
-        c = cand[cand["src"] == src].copy()
-        if c.empty:
-            continue
-        a = s1.iloc[c["s1_row"].to_numpy()]
-        b = docs[src].iloc[c["doc_row"].to_numpy()]
-        an, bn = a["name_n"].tolist(), b["name_n"].tolist()
-        aa, ba = a["addr_n"].tolist(), b["addr_n"].tolist()
-        c["name_ratio"] = _sim(an, bn, fuzz.ratio)
-        c["name_tset"] = _sim(an, bn, fuzz.token_set_ratio)
-        c["name_partial"] = _sim(an, bn, fuzz.partial_ratio)
-        c["name_jw"] = _sim(an, bn, JaroWinkler.normalized_similarity)
-        c["legal_ratio"] = _sim(a["name_legal"].tolist(), b["name_legal"].tolist(), fuzz.ratio)
-        c["nospace_ratio"] = _sim(a["name_nospace"].tolist(), b["name_nospace"].tolist(), fuzz.ratio)
-        c["translit_ratio"] = _sim(a["name_tr"].tolist(), b["name_tr"].tolist(), fuzz.token_set_ratio)
-        c["addr_ratio"] = _sim(aa, ba, fuzz.ratio)
-        c["addr_tset"] = _sim(aa, ba, fuzz.token_set_ratio)
-        c["addr_partial"] = _sim(aa, ba, fuzz.partial_ratio)
-        (c["digit_jacc"], c["house_state"], c["n_digits_s1"],
-         c["n_digits_rec"]) = _digit_features(a["addr_digits"].tolist(), b["addr_digits"].tolist())
-        c["rec_indic"] = (b["script"].to_numpy() > 0).astype(np.int8)
-        c["rec_addr_empty"] = (b["addr_n"].to_numpy() == "").astype(np.int8)
-        la, lb = a["name_n"].str.len().to_numpy(), b["name_n"].str.len().to_numpy()
-        c["name_len_ratio"] = (np.minimum(la, lb) / np.maximum(np.maximum(la, lb), 1)).astype(np.float32)
-        la, lb = a["addr_n"].str.len().to_numpy(), b["addr_n"].str.len().to_numpy()
-        c["addr_len_ratio"] = (np.minimum(la, lb) / np.maximum(np.maximum(la, lb), 1)).astype(np.float32)
-        out.append(c)
-    return pd.concat(out, ignore_index=True)
+def string_block(store, src: int, s1_rows: np.ndarray, doc_rows: np.ndarray) -> dict:
+    """String/structure features for aligned (S1 row, doc row) arrays of one source."""
+    def pair(col):
+        return store.strings(1, col, s1_rows), store.strings(src, col, doc_rows)
+
+    out = {}
+    an, bn = pair("name_n")
+    out["name_ratio"] = _sim(an, bn, fuzz.ratio)
+    out["name_tset"] = _sim(an, bn, fuzz.token_set_ratio)
+    out["name_partial"] = _sim(an, bn, fuzz.partial_ratio)
+    out["name_jw"] = _sim(an, bn, JaroWinkler.normalized_similarity)
+    out["name_len_ratio"] = _len_ratio(an, bn)
+    del an, bn
+    a, b = pair("name_legal")
+    out["legal_ratio"] = _sim(a, b, fuzz.ratio)
+    a, b = pair("name_nospace")
+    out["nospace_ratio"] = _sim(a, b, fuzz.ratio)
+    a, b = pair("name_tr")
+    out["translit_ratio"] = _sim(a, b, fuzz.token_set_ratio)
+    aa, ba = pair("addr_n")
+    out["addr_ratio"] = _sim(aa, ba, fuzz.ratio)
+    out["addr_tset"] = _sim(aa, ba, fuzz.token_set_ratio)
+    out["addr_partial"] = _sim(aa, ba, fuzz.partial_ratio)
+    out["addr_len_ratio"] = _len_ratio(aa, ba)
+    out["rec_addr_empty"] = np.fromiter((x == "" for x in ba), dtype=np.int8, count=len(ba))
+    del aa, ba
+    a, b = pair("addr_digits")
+    (out["digit_jacc"], out["house_state"], out["n_digits_s1"],
+     out["n_digits_rec"]) = _digit_features(a, b)
+    del a, b
+    script = store.numpy(src, "script")[doc_rows]
+    out["rec_indic"] = (script > 0).astype(np.int8)
+    return out
+
+
+def write_features(cand: pd.DataFrame, store, path: str, chunk: int = 500_000,
+                   log=print) -> int:
+    """Compute string features chunk by chunk and append everything to ``path``.
+
+    ``cand`` holds keys, retrieval features and (on train) ``label``. Returns the
+    number of rows written. Row order in the file = row order of ``cand``.
+    """
+    writer = None
+    n = len(cand)
+    for start in range(0, n, chunk):
+        part = cand.iloc[start:start + chunk]
+        blocks = []
+        for src in (2, 3):
+            m = (part["src"] == src).to_numpy()
+            if not m.any():
+                continue
+            sub = part[m].reset_index(drop=True)
+            feats = string_block(store, src, sub["s1_row"].to_numpy(), sub["doc_row"].to_numpy())
+            blocks.append(pd.concat([sub, pd.DataFrame(feats)], axis=1))
+        table = pa.Table.from_pandas(pd.concat(blocks, ignore_index=True), preserve_index=False)
+        if writer is None:
+            writer = pq.ParquetWriter(path, table.schema, compression="zstd")
+        writer.write_table(table)
+        del blocks, table
+        if log and (start // chunk) % 10 == 0:
+            log(f"    features {min(start + chunk, n):,}/{n:,}")
+    if writer is not None:
+        writer.close()
+    return n

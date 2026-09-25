@@ -213,7 +213,11 @@ def normalize_frame(df: pd.DataFrame, translit: bool = True) -> pd.DataFrame:
 
 def normalize_parallel(df: pd.DataFrame, n_jobs: int | None = None,
                        chunk: int = 200_000) -> pd.DataFrame:
-    """:func:`normalize_frame` over row chunks in a process pool (same output)."""
+    """:func:`normalize_frame` over row chunks in a process pool (same output).
+
+    In-memory convenience for small frames; full tables go through
+    :func:`build_normalized`, which streams to parquet.
+    """
     import os
     from concurrent.futures import ProcessPoolExecutor
 
@@ -225,33 +229,81 @@ def normalize_parallel(df: pd.DataFrame, n_jobs: int | None = None,
         return pd.concat(list(pool.map(normalize_frame, parts)), ignore_index=True)
 
 
-def load_normalized(split: str, source: int) -> pd.DataFrame:
-    """Normalized views of ``{split}_source{source}``, cached as parquet."""
-    from .config import artifact_path, ensure_parent
-    from .io import load_source
+def build_normalized(split: str, source: int, n_jobs: int = 8, chunk: int = 200_000) -> str:
+    """Stream ``{split}_source{source}.tsv`` -> normalized parquet; return its path.
+
+    Memory stays bounded: the raw TSV is read ``chunk`` rows at a time and at
+    most ``2 * n_jobs`` chunks are in flight in the worker pool; each finished
+    chunk is appended to the parquet file (one row group) in input order.
+    """
+    import os
+    from collections import deque
+    from concurrent.futures import ProcessPoolExecutor
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from .config import artifact_path, data_path, ensure_parent
 
     path = artifact_path("norm", f"{split}_source{source}.parquet")
-    try:
-        return pd.read_parquet(path)
-    except (FileNotFoundError, OSError):
-        out = normalize_parallel(load_source(split, source))
-        ensure_parent(path)
-        out.to_parquet(path, index=False)
-        return out
+    tmp = path + ".tmp"
+    ensure_parent(path)
+    reader = pd.read_csv(data_path(split, f"{split}_source{source}.tsv"), sep="\t", dtype=str,
+                         keep_default_na=False, na_filter=False, chunksize=chunk)
+    writer, window = None, deque()
+    with ProcessPoolExecutor(max_workers=n_jobs) as pool:
+        def drain(limit):
+            nonlocal writer
+            while len(window) > limit:
+                table = pa.Table.from_pandas(window.popleft().result(), preserve_index=False)
+                if writer is None:
+                    writer = pq.ParquetWriter(tmp, table.schema)
+                writer.write_table(table)
+        for part in reader:
+            window.append(pool.submit(normalize_frame, part))
+            drain(2 * n_jobs)
+        drain(0)
+    if writer is not None:
+        writer.close()
+    os.replace(tmp, path)
+    return path
+
+
+def load_normalized(split: str, source: int) -> pd.DataFrame:
+    """Normalized views of ``{split}_source{source}`` as pandas (built once, streamed)."""
+    import os
+
+    from .config import artifact_path
+
+    path = artifact_path("norm", f"{split}_source{source}.parquet")
+    if not os.path.exists(path):
+        build_normalized(split, source)
+    return pd.read_parquet(path)
 
 
 def main() -> None:
     """Build every normalized cache and print a short profile per table."""
     import time
 
+    import os
+
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    from .config import artifact_path
+    from .memory import mem_str
+
     for split in ("train", "test"):
         for source in (1, 2, 3):
             t = time.time()
-            df = load_normalized(split, source)
-            empty_addr = (df["addr_n"] == "").mean()
-            indic = (df["script"] > 0).mean()
-            print(f"{split}_source{source}: {len(df):,} rows, empty addr {empty_addr:.2%}, "
-                  f"Indic names {indic:.2%}, {time.time() - t:.0f}s")
+            path = artifact_path("norm", f"{split}_source{source}.parquet")
+            if not os.path.exists(path):
+                build_normalized(split, source)
+            tab = pq.read_table(path, columns=["addr_n", "script"])
+            empty_addr = pc.mean(pc.equal(tab["addr_n"], "").cast("int8")).as_py()
+            indic = pc.mean(pc.greater(tab["script"], 0).cast("int8")).as_py()
+            print(f"{split}_source{source}: {tab.num_rows:,} rows, empty addr {empty_addr:.2%}, "
+                  f"Indic names {indic:.2%}, {time.time() - t:.0f}s {mem_str()}", flush=True)
 
 
 if __name__ == "__main__":

@@ -59,7 +59,18 @@ def make_submission(name: str, matches: pd.DataFrame, candidates: pd.DataFrame,
     s1_ids = load_source("test", 1)["entity_id"]
     write_id_lists(matches, s1_ids, matching_path, "matching")
     write_id_lists(candidates, s1_ids, candidate_path, "candidate")
+    return finalize_submission(name, matching_path, candidate_path, offline_metrics,
+                               len(matches), len(candidates), notes)
 
+
+def finalize_submission(name: str, matching_path: str, candidate_path: str,
+                        offline_metrics: dict | None = None, n_match_pairs: int = 0,
+                        n_candidate_pairs: int = 0, notes: str = "") -> Path:
+    """Validate already-written output files and snapshot them to ``subs/<name>/``.
+
+    Used by the memory-lean pipeline, which streams both TSVs itself. Raises if
+    the official validator reports errors.
+    """
     errors, warnings = run_validator(matching_path, candidate_path, data_path("test"))
     for w in warnings:
         print("WARNING:", w)
@@ -76,8 +87,8 @@ def make_submission(name: str, matches: pd.DataFrame, candidates: pd.DataFrame,
         "commit": _git_commit(),
         "config": load_config(),
         "offline_metrics": offline_metrics or {},
-        "n_match_pairs": int(len(matches)),
-        "n_candidate_pairs": int(len(candidates)),
+        "n_match_pairs": int(n_match_pairs),
+        "n_candidate_pairs": int(n_candidate_pairs),
         "leaderboard_score": None,  # fill in after upload
         "notes": notes,
     }

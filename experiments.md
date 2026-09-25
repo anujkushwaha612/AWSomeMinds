@@ -150,3 +150,60 @@ Unions (top-5 of NA ∪ top-5 of A, same representation and cap):
   retrievers (A may still be useful as a *feature*).
 - **Next:** full-scale R1 on train India + US at k_r ≤ 5 → rank table → audit (oracle macro-F0.5 vs
   mean |C|); then test; then the baseline matcher and Sub #1.
+
+---
+
+## E1 — Memory-lean pipeline: audit, store loading, worker count (2026-09-26)
+
+**Why.** Free-tier AWS offers ≤ 8 GB instances, and the first version of `ber.baseline` held everything
+in RAM (estimated train peak ≈ 9–11 GB, from reading the code). Goal: run locally on 15.7 GB with
+peak ≤ 8 GB, without changing the method.
+
+**Audit of the first version** (derived from the code, not measured): the largest resident objects were
+all normalized text columns as pandas objects (~3 GB per country), count matrices plus a TF-IDF copy for
+all sources (~2.5–3.5 GB for India), the full feature table concatenated (31M × 36 columns) plus a
+float32 copy (3.3 GB), and in `predict` a re-read of every text column just to get ids, plus string
+merges for the output.
+
+**Changes (method unchanged)**
+- Arrow text store per country (`ber.store`); candidates hold only integer row ids.
+- Retrieval in two streaming passes (document-frequency pass, then hash + search per chunk); only the S1
+  index and at most `window` hashed chunks are resident.
+- String features in 500k-pair chunks, appended to parquet; train/predict stream batches from parquet.
+- LightGBM trains on 30% of entities with *all* their candidates (same rule as before; no negative
+  subsampling); out-of-fold prediction for every pair, batch by batch.
+- Output TSVs streamed per country from compact arrays; matches ⊆ candidates by construction.
+- Memory logged at every stage (`ber.memory`).
+
+**Measurement 1: loading one country's text** (train India, 8 columns, Arrow data = 1.08 GB)
+
+| Method | Load time | Process memory after load |
+|---|---|---|
+| `pq.read_table(filters=country)` (mimalloc pool) | 4 s | 4.07 GB |
+| same, system allocator | 3 s | 3.44 GB |
+| **batch-wise filter** (200k-row batches) | 6 s | **1.66 GB** |
+
+Whole-file filtered reads materialize every country's rows first, and the freed memory stays in
+Arrow's pool. → KEEP batch-wise filtering (in `CountryStore`).
+
+**Measurement 2: hashing worker count** (one pass over all 2,017,799 train-India S2 records, word 1+2-grams,
+50k-row chunks, window = 2 × workers; peak = main + workers, sampled every 0.2 s)
+
+| Workers | Time | Throughput | Peak tree memory (above the loaded store) |
+|---|---|---|---|
+| 4 | 13.5 s | 150k rec/s | +0.83 GB |
+| **8** | **11.2 s** | **180k rec/s** | +1.56 GB |
+| 12 | 12.2 s | 166k rec/s | +1.85 GB |
+| 15 | 13.3 s | 151k rec/s | +2.24 GB |
+
+Beyond 8 workers the main process (slicing texts, accumulating counts) is the bottleneck, so more
+workers only add memory. → KEEP `workers: 8`.
+
+**Smoke test** (40k rows per source per country, all stages incl. the official validator): PASS. Peak
+main-process memory: build 2.2 GB, train 0.52 GB, predict 0.82 GB. On the slice, record-side top-3
+retrieval found 97.0% (India) / 99.2% (US) of the true pairs present in the slice. That's a smaller
+universe than the real one, so it's not a full-scale estimate. The smoke F0.5 is meaningless (the
+slice is mostly singletons).
+
+**Verdict.** KEEP the lean pipeline. Full-scale memory and timings are still to be measured on the
+first real run and recorded here.
