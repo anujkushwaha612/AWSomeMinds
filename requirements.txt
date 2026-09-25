@@ -1,0 +1,13 @@
+# Python 3.13 (CPython). pandas is pinned to 2.x: on Windows with Smart App Control
+# enabled, pandas 3.0.6's compiled groupby module is blocked; 2.3.3 loads fine.
+numpy==2.5.3
+pandas==2.3.3
+pyarrow==25.0.1
+scipy==1.18.1
+scikit-learn==1.9.1
+lightgbm==4.7.0
+RapidFuzz==3.14.6
+sparse_dot_topn==1.2.0
+PyYAML==6.0.3
+s3fs==2026.9.0
+pytest==9.1.1

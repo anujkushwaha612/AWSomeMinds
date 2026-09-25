@@ -1,0 +1,33 @@
+# Every number the pipeline uses lives here (plan.md Step 0).
+# Paths may be local or s3:// URIs. Override the whole file with BER_CONFIG=<path>.
+
+# Raw challenge data. Local copy by default; on SageMaker either sync it locally or
+# point at the read-only bucket: s3://awsomeminds-dataset-532749777349/dataset
+data_root: data/dataset
+
+# Where every stage writes its outputs (parquet caches, folds, scores, submissions).
+# Local disk for one teammate; an s3:// URI for the other (same code either way).
+artifacts_root: artifacts
+
+seed: 2026
+
+validation:
+  n_folds: 5            # entity-level cross-fitting on the full train universe
+  report_fold: 0        # decision params tuned on the other folds, reported here
+  k_buckets: [0, 1, 2, 3, 4, 5, 6]   # last bucket means ">= 6"
+
+blocking:
+  # char n-gram TF-IDF, fitted per country on that country's S1+S2+S3 texts
+  ngram: [3, 3]
+  min_df: 2
+  max_df: 0.10          # drop n-grams in >10% of records (pvt/ltd/inc): speed, little signal
+  views: [NA, A, N]     # NA = name+address, A = address only, N = name only, T = translit [EXP]
+  k_forward: 50         # S1 -> top-k per source (stored; audit picks the K actually used)
+  k_reverse: 10         # S2/S3 -> top-k S1
+  query_chunk: 20000
+  n_threads: 0          # 0 = all cores
+
+bootstrap:
+  n_resamples: 1000
+  alpha: 0.05
+  materiality: 0.002    # [J] minimum Δ macro-F0.5 worth keeping a component for

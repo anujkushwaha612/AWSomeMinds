@@ -1,1 +1,17 @@
+# raw challenge data (2.4 GB; lives on S3 / local disk, never in git)
 data/*
+!data/README.md
+!data/Documentation_template.md
+!data/utils/
+
+# generated artifacts and outputs (local disk or S3, see configs/pipeline.yaml)
+artifacts/
+output/
+subs/*/*.tsv
+*.parquet
+
+# python
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
