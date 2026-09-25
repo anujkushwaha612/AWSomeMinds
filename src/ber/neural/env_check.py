@@ -9,12 +9,15 @@ not guessed.
 Run:  python -m ber.neural.env_check
 """
 
+import os
 import time
 
 import numpy as np
+import pyarrow.parquet as pq
 
-from ..store import split_countries
-from .common import Encoder, amp_dtype, country_store, ncfg, store_texts
+from ..config import artifact_path
+from ..store import norm_path, split_countries
+from .common import Encoder, amp_dtype, country_store, ncfg, store_texts, vdir
 
 N_ENC = 20_000
 N_STEPS = 30
@@ -75,16 +78,21 @@ def main() -> None:
     step_rate = N_STEPS / (time.time() - t)
     peak = torch.cuda.max_memory_allocated() / 2**30 if torch.cuda.is_available() else float("nan")
 
-    n_pairs = c["n_pairs"] or 3_060_000        # E4: folds-3/4 positives
-    n_texts = 24_200_000                       # E4 / phase0: all S1 + S2 + S3, train + test
+    # sizes from the data itself: texts to encode = every S1/S2/S3 row of train and test
+    n_texts = sum(pq.ParquetFile(norm_path(split, s)).metadata.num_rows
+                  for split in ("train", "test") for s in (1, 2, 3))
+    pairs_path = artifact_path(vdir("neural"), "train_pairs.parquet")
+    n_pairs = c["n_pairs"] or (pq.ParquetFile(pairs_path).metadata.num_rows
+                               if os.path.exists(pairs_path) else 3_060_000)   # E4 measurement until A1 ran
     train_h = n_pairs / B / step_rate / 3600 * c["epochs"]
     enc_h = n_texts / enc_rate / 3600
     print(f"\nencoding : {enc_rate:,.0f} texts/s  (max_len {c['max_len']}, batch {c['encode_batch']})")
-    print(f"training : {step_rate:.2f} steps/s at batch {B}  (peak VRAM {peak:.1f} GB)")
+    print(f"training : {step_rate:.2f} steps/s at batch {B}  (peak VRAM {peak:.1f} GB, "
+          f"grad checkpointing {bool(c.get('grad_checkpointing', False))}, emb_store {c.get('emb_store', 'gpu')})")
     print(f"estimates: train encoder on {n_pairs:,} pairs ~ {train_h:.1f} h | "
           f"encode all {n_texts:,} texts (search) ~ {enc_h:.1f} h | recall gate ~ "
           f"{(2_300_000 + 40_000) / enc_rate / 3600:.2f} h")
-    budget_h = 3.0
+    budget_h = float(c.get("train_budget_h", 3.0))
     if train_h > budget_h:
         suggest = int(budget_h * 3600 * step_rate * B / c["epochs"])
         print(f"SUGGESTION: training exceeds {budget_h:.0f} h -> set v5.neural.n_pairs to ~{suggest:,} "

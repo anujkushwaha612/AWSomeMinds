@@ -28,7 +28,9 @@ its gate by the evening of 26 Sep.
 ## 1. Where each step runs
 
 **Everything runs on the GPU machine** (friend: 48 GB VRAM, ~15.7 GB RAM): `run_v5.ps1` executes
-A → B → C end to end; setup and inputs are in [GPU_RUNBOOK.md](GPU_RUNBOOK.md). The laptop has no
+A → B → C end to end; setup and inputs are in [GPU_RUNBOOK.md](GPU_RUNBOOK.md). Backup: the GPU stages
+A0–A4 on Colab (`colab/run_v5_colab.ipynb`, outputs on Drive), then `run_v5.ps1 -CpuOnly` on the laptop
+(GPU_RUNBOOK.md §7). The laptop has no
 NVIDIA GPU (and Smart App Control blocks PyTorch there); it only prepared the code and the baseline
 artifacts (`artifacts/`, ~7.5 GB: copy them over, or rebuild with `run_baseline.ps1`, ~2.5 h).
 The CPU stages (union, GBDT, gap) are memory-capped for 15.7 GB (lean pipeline, `max_train_rows`).

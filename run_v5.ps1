@@ -1,7 +1,10 @@
 # Strategy v5 (A + B + C) end to end on the GPU machine. See GPU_RUNBOOK.md first.
 # Usage (PowerShell, repo folder):   powershell -ExecutionPolicy Bypass -File .\run_v5.ps1
+#   -CpuOnly   skip the GPU stages A0-A4 (they ran on Colab / the GPU box; artifacts\neural and
+#              artifacts\dense were copied here) and run A5 -> B -> C on this machine.
 # Stops at the first failing stage; re-running resumes (finished stages are skipped or
 # restart from their checkpoint).
+param([switch]$CpuOnly)
 
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
@@ -33,11 +36,19 @@ if (-not (Test-Path "artifacts\baseline\train\US.parquet")) {
 }
 
 Stage "tests"                         @("-m", "pytest", "-q")
-Stage "A0 environment + throughput"   @("-u", "-m", "ber.neural.env_check")
-Stage "A1 training pairs (CPU)"       @("-u", "-m", "ber.neural.pairs")
-Stage "A2-A3 fine-tune + recall gate" @("-u", "-m", "ber.neural.train_biencoder")
-Stage "A4 dense search: train"        @("-u", "-m", "ber.neural.dense_retrieve", "--split", "train")
-Stage "A4 dense search: test"         @("-u", "-m", "ber.neural.dense_retrieve", "--split", "test")
+if ($CpuOnly) {
+    foreach ($f in @("artifacts\neural\eval.json", "artifacts\dense\train\US_dense.parquet",
+                     "artifacts\dense\test\France_dense.parquet")) {
+        if (-not (Test-Path $f)) { Write-Host "-CpuOnly needs $f (copy artifacts\neural and artifacts\dense from the GPU run)." -ForegroundColor Red; exit 1 }
+    }
+    Write-Host "CpuOnly: skipping A0-A4 (GPU stages)" -ForegroundColor Yellow
+} else {
+    Stage "A0 environment + throughput"   @("-u", "-m", "ber.neural.env_check")
+    Stage "A1 training pairs (CPU)"       @("-u", "-m", "ber.neural.pairs")
+    Stage "A2-A3 fine-tune + recall gate" @("-u", "-m", "ber.neural.train_biencoder")
+    Stage "A4 dense search: train"        @("-u", "-m", "ber.neural.dense_retrieve", "--split", "train")
+    Stage "A4 dense search: test"         @("-u", "-m", "ber.neural.dense_retrieve", "--split", "test")
+}
 Stage "A5 union features: train"      @("-u", "-m", "ber.union", "--split", "train")
 Stage "A5 union features: test"       @("-u", "-m", "ber.union", "--split", "test")
 Stage "B stage 1 (union GBDT)"        @("-u", "-m", "ber.v5", "stage1")

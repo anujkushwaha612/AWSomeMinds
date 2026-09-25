@@ -1,0 +1,15 @@
+# Colab: torch, numpy, pandas and pyarrow are preinstalled with matching CUDA / ABI builds and
+# must NOT be reinstalled (requirements.txt pins are for the Windows laptop). Everything else:
+scipy
+scikit-learn
+lightgbm
+RapidFuzz
+sparse_dot_topn
+psutil
+PyYAML
+pytest
+transformers>=4.44,<5
+tokenizers>=0.19
+safetensors>=0.4
+huggingface_hub>=0.23
+sentencepiece>=0.2

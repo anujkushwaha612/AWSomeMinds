@@ -75,11 +75,38 @@ minutes. The full console log is in `artifacts\v5\run_v5_console.txt`.
 `artifacts\v5\log.txt`, `artifacts\v5\*.json`, `artifacts\neural\eval.json`, `artifacts\experiments\C*.json`,
 and `output\matching_results.tsv` + `output\candidate_pairs.tsv` (or upload from the GPU machine).
 
-## 7. If something runs out of memory
+## 7. Alternative: Google Colab for the GPU stages (A0–A4), laptop for the rest
+
+`colab/run_v5_colab.ipynb` runs A0–A4 on any Colab GPU and keeps every output on Drive
+(`MyDrive/AWSomeMinds/artifacts/{neural,dense}`); it is resumable after a disconnect. The first cell of
+the notebook lists what to upload (`inputs/` folder, ~7.5 GB: `artifacts/{norm,baseline,neural,folds.parquet}`).
+
+The notebook writes a config override per GPU (nothing in the repo is edited):
+
+| GPU | model (`auto`) | batch | grad checkpointing | `emb_store` | tile |
+|---|---|---|---|---|---|
+| ≥ 40 GB (A100, the 48 GB box) | e5-base | 256 | off | `gpu` (all embeddings resident) | 6 GB |
+| 20–40 GB (L4, A10) | e5-base | 256 | on | `disk` (memmaps; S1 + one source on the GPU) | 3 GB |
+| < 20 GB (T4) | e5-small | 256 | on | `disk` | 1.5 GB |
+
+Why: batch 256 = 768 texts per step; without activation checkpointing that is ~18 GB of activations
+for e5-base, and US train's 7.5M embeddings are 11.5 GB in fp16, which only fits resident on ≥ 40 GB.
+
+Afterwards, on the laptop: download `MyDrive/AWSomeMinds/artifacts/neural` (needs only `eval.json` and
+`biencoder/` if you want to reuse the encoder) and `artifacts/dense` into `artifacts\`, then
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run_v5.ps1 -CpuOnly
+```
+
+runs A5 → B → C (union features, GBDT stages, compare, stress, predict). Fold-0 F0.5 is in
+`artifacts\v5\stage2.json`, the paired comparison with the baseline in `compare.json`.
+
+## 8. If something runs out of memory
 
 | Symptom | Setting (configs\pipeline.yaml → v5) |
 |---|---|
-| CUDA out of memory in training | `neural.batch_size: 128` |
-| CUDA out of memory in search | `neural.tile_gb: 3.0`, `neural.encode_batch: 256` |
+| CUDA out of memory in training | `neural.grad_checkpointing: true` first (same batch, ~30% slower); then `neural.batch_size: 128` |
+| CUDA out of memory in search | `neural.emb_store: disk` (only S1 + one source resident), `neural.tile_gb: 3.0`, `neural.encode_batch: 256` |
 | RAM (MemoryError / killed) in stage 1 | `max_train_rows: 12000000` |
 | Training too slow | `neural.n_pairs` as suggested by env_check, or `neural.model: intfloat/multilingual-e5-small` |

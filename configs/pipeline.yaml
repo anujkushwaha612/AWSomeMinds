@@ -73,6 +73,13 @@ v5:
     k_rec: 3                  # E4: TF-IDF finds 97-98% of found parents at rank 0; ranks 1-2 add 2-3 pp
     k_s1: 5                   # E4: S1-side list per source; per-source true matches <= 5 for 100% (S2) / 99.9% (S3)
     tile_gb: 6.0              # similarity tile size on the GPU
+    # memory profile (defaults = the 48 GB box; colab/run_v5_colab.ipynb overrides them per GPU)
+    grad_checkpointing: false # true: ~5x less activation memory, ~30% slower -> batch 256 on 16-24 GB cards
+    ckpt_every: 2000          # training steps between resumable checkpoints
+    emb_store: gpu            # gpu = a country's embeddings resident in VRAM (US train ~11.5 GB);
+                              # disk = float16 memmaps, only S1 + one source on the GPU (~9 GB peak)
+    emb_dir: null             # folder for the memmaps (disk mode); null = artifacts/dense/emb
+    train_budget_h: 3.0       # env_check suggests a smaller n_pairs if training would take longer
   drop_encoder_records: false # true = remove encoder-seen records from the train GBDT universe (leakage check fallback)
   prune_tau: 0.003            # E4: 14.0 -> 5.05 candidates/S1 at oracle loss 0.00004
   train_frac: 1.0             # share of gbdt-fold entities per fold model (60% of all entities in total)

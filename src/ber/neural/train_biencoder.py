@@ -4,7 +4,8 @@ Loss: in-batch softmax (MultipleNegativesRanking) over [positives; hard negative
 for each record query, scale ``v5.neural.scale``. Batches are drawn from one country
 at a time (``same_country_batches``): cross-country negatives are trivially easy.
 Mixed precision (bf16 where supported), AdamW, linear warmup/decay, grad clip 1.0.
-Checkpoints every 2,000 steps to artifacts/neural/biencoder (resumable).
+Checkpoints every ``ckpt_every`` steps to artifacts/neural/biencoder (resumable);
+``grad_checkpointing`` (config) makes batch 256 fit on 16-24 GB cards.
 
 Recall gate (``--eval-only`` runs just this): for the fold-0 sample, record-side
 top-5 over the FULL S1 universe of the country; R@1/3/5 overall, Latin, Indic,
@@ -65,6 +66,9 @@ def train(max_steps: int | None = None) -> None:
     c, seed = ncfg(), load_config()["seed"]
     torch.manual_seed(seed)
     pairs = pd.read_parquet(artifact_path(vdir("neural"), "train_pairs.parquet"))
+    if c["n_pairs"] and c["n_pairs"] < len(pairs):           # budget cap, also when A1 ran elsewhere
+        pairs = pairs.sample(int(c["n_pairs"]), random_state=seed).reset_index(drop=True)
+        print(f"using {len(pairs):,} of the training pairs (v5.neural.n_pairs)", flush=True)
     names = split_countries("train")
     stores = {code: country_store("train", country, cols=["name_n", "addr_n"])
               for code, country in enumerate(names) if (pairs["country"] == code).any()}
@@ -83,6 +87,12 @@ def train(max_steps: int | None = None) -> None:
     start = 0
     if resume:
         state = json.load(open(os.path.join(ckpt, "train_state.json")))
+        same = (state.get("model", c["model"]) == c["model"]
+                and state.get("n_batches", len(batches)) == len(batches))
+        if not same:                                          # a different model / pair set / batch size
+            raise RuntimeError(f"checkpoint in {ckpt} was made with model={state.get('model')}, "
+                               f"{state.get('n_batches')} batches; the config now gives model={c['model']}, "
+                               f"{len(batches)} batches. Delete the folder or restore the config")
         start = state["step"]
         opt_path = os.path.join(ckpt, "optimizer.pt")
         if os.path.exists(opt_path):
@@ -91,6 +101,7 @@ def train(max_steps: int | None = None) -> None:
             sched.load_state_dict(s["sched"])
         print(f"resuming from step {start:,}/{total:,}", flush=True)
     labels = None
+    ckpt_every = int(c.get("ckpt_every", 2000))
     t0, losses = time.time(), []
     for step in range(start, total):
         q, p, n = texts_for_batch(stores, pairs, batches[step])
@@ -112,15 +123,17 @@ def train(max_steps: int | None = None) -> None:
         done = step + 1
         if done % 100 == 0 or done == total:
             rate = (done - start) / (time.time() - t0)
+            vram = f"  VRAM {torch.cuda.max_memory_allocated() / 2**30:.1f} GB" if use_amp else ""
             print(f"step {done:,}/{total:,}  loss {np.mean(losses[-100:]):.4f}  {rate:.2f} steps/s  "
-                  f"ETA {(total - done) / max(rate, 1e-9) / 60:.0f} min", flush=True)
-        if done % 2000 == 0 or done == total:
+                  f"ETA {(total - done) / max(rate, 1e-9) / 60:.0f} min{vram}", flush=True)
+        if done % ckpt_every == 0 or done == total:
             os.makedirs(ckpt, exist_ok=True)
             enc.model.save_pretrained(ckpt)
             enc.tok.save_pretrained(ckpt)
             torch.save({"opt": opt.state_dict(), "sched": sched.state_dict()},
                        os.path.join(ckpt, "optimizer.pt"))
-            json.dump({"step": done, "total": total}, open(os.path.join(ckpt, "train_state.json"), "w"))
+            json.dump({"step": done, "total": total, "model": c["model"], "n_batches": len(batches)},
+                      open(os.path.join(ckpt, "train_state.json"), "w"))
     print(f"saved fine-tuned encoder -> {ckpt}", flush=True)
 
 
