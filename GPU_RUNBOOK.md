@@ -58,7 +58,8 @@ Stage 15 (and 11) also log `[ensemble] lgb / xgb / mean` tuning scores and the c
 is kept unless another option gains ≥ 0.0005 on the tuning folds.
 
 If step 5 estimates encoder training above ~3 h, stop, set `v5.neural.n_pairs` in
-`configs\pipeline.yaml` to the suggested value, and run again with `-Redo pairs`.
+`configs\pipeline.yaml` to the suggested value, and run again with `-Redo train_encoder` (training
+draws that many triplets, seeded; the checkpoint restarts because the run changed).
 
 ## 4. After it finishes
 

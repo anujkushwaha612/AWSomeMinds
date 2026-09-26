@@ -95,6 +95,14 @@ def duplicate_text_mask(pos_texts: list[str], neg_texts: list[str]) -> np.ndarra
     return mask
 
 
+def subsample_pairs(pairs: pd.DataFrame, n: int, seed: int) -> pd.DataFrame:
+    """A seeded random subset of ``n`` triplets (``v5.neural.n_pairs``; 0 = all): the GPU time budget."""
+    if not n or n >= len(pairs):
+        return pairs
+    keep = np.sort(np.random.default_rng(seed).choice(len(pairs), int(n), replace=False))
+    return pairs.iloc[keep].reset_index(drop=True)
+
+
 def run_fingerprint(pairs: pd.DataFrame, c: dict) -> str:
     """Identifies a training run; a checkpoint is resumed only if this matches."""
     import hashlib
@@ -114,6 +122,10 @@ def train(max_steps: int | None = None) -> None:
     c, seed = ncfg(), load_config()["seed"]
     torch.manual_seed(seed)
     pairs = pd.read_parquet(artifact_path(vdir("neural"), "train_pairs.parquet"))
+    n_all = len(pairs)
+    pairs = subsample_pairs(pairs, c.get("n_pairs") or 0, seed)
+    print(f"training on {len(pairs):,} of {n_all:,} triplets (v5.neural.n_pairs = {c.get('n_pairs') or 0})",
+          flush=True)
     names = split_countries("train")
     stores = {code: country_store("train", country, cols=["name_n", "addr_n"])
               for code, country in enumerate(names) if (pairs["country"] == code).any()}

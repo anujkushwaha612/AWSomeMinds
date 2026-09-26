@@ -95,6 +95,6 @@
   },
   "n_match_pairs": 5537986,
   "n_candidate_pairs": 29899751,
-  "leaderboard_score": null,
+  "leaderboard_score": 0.938,
   "notes": "baseline: word1+2 TF-IDF record-side top-k, LightGBM, D2 + arbitration"
 }

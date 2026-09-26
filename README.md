@@ -2,7 +2,7 @@
 
 Pipeline: normalization → same-country candidate generation (TF-IDF ∪ fine-tuned e5 bi-encoder) →
 LightGBM stage 1 → pruning → cross-encoder on the gray zone → LightGBM stage 2 → entity decision layer.
-Full GPU run: [GPU_RUNBOOK.md](GPU_RUNBOOK.md); design and upgrade review: [strategy_v5.md](strategy_v5.md) §9. Strategy and gates: [plan.md](plan.md). Data findings:
+Full GPU run: [GPU_RUNBOOK.md](GPU_RUNBOOK.md); without a GPU (free Kaggle T4s + laptop): [KAGGLE.md](KAGGLE.md); design and upgrade review: [strategy_v5.md](strategy_v5.md) §9. Strategy and gates: [plan.md](plan.md). Data findings:
 [phase0_report.md](phase0_report.md).
 
 ## Setup

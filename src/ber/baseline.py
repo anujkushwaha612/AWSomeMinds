@@ -50,7 +50,7 @@ import pyarrow.parquet as pq
 from .blocking.word_retrieval import retrieve_country
 from .config import REPO_ROOT, artifact_path, ensure_parent, load_config
 from .eval.scorer import f05_from_counts, k_bucket
-from .features import FEATURES, KEY_COLS, retrieval_features, write_features
+from .features import CHAIN_FEATURES, FEATURES, GEN_FEATURES, KEY_COLS, retrieval_features, write_features
 from .memory import mem_str
 from .store import CountryStore, split_countries
 
@@ -61,6 +61,16 @@ log = logging.getLogger("ber.baseline")
 def cfg() -> dict:
     """The ``baseline`` section of configs/pipeline.yaml."""
     return load_config()["baseline"]
+
+
+def model_features() -> list[str]:
+    """Features the model trains on (feature files from ``python -m ber.gen_augment``; experiments.md E6):
+    ``BER_GEN=1`` / ``genchain`` adds GEN_FEATURES + CHAIN_FEATURES, ``gen`` adds GEN_FEATURES only,
+    unset = the baseline set."""
+    mode = os.environ.get("BER_GEN", "")
+    if mode in ("1", "genchain"):
+        return FEATURES + GEN_FEATURES + CHAIN_FEATURES
+    return FEATURES + GEN_FEATURES if mode == "gen" else FEATURES
 
 
 def run_path(*parts: str) -> str:
@@ -283,6 +293,7 @@ def train(overrides: dict | None = None) -> None:
         else:
             c[k] = val
     v = load_config()["validation"]
+    feats = model_features()
     keys, ents = read_keys("train")
     names = split_countries("train")
     log.info(f"[train] {len(keys):,} pairs, {len(ents):,} entities, "
@@ -305,10 +316,10 @@ def train(overrides: dict | None = None) -> None:
     # sample pass: read features of sampled entities only, into one preallocated matrix
     # (no list-of-batches + concatenate, which would briefly hold two copies)
     n_samp = int(pair_samp.sum())
-    Xs = np.empty((n_samp, len(FEATURES)), dtype=np.float32)
+    Xs = np.empty((n_samp, len(feats)), dtype=np.float32)
     offset = filled = 0
     for code, country in enumerate(names):
-        for X in feature_batches("train", country, FEATURES, c["predict_batch"]):
+        for X in feature_batches("train", country, feats, c["predict_batch"]):
             sel = pair_samp[offset:offset + len(X)]
             n = int(sel.sum())
             Xs[filled:filled + n] = X[sel]
@@ -325,7 +336,7 @@ def train(overrides: dict | None = None) -> None:
     # Bin the sample once, free the float matrix, and cut each fold's train / early-stop
     # sets as subsets of the binned data (no per-fold copies of the raw features).
     t = time.time()
-    full = lgb.Dataset(Xs, ys, feature_name=FEATURES, params=params, free_raw_data=True)
+    full = lgb.Dataset(Xs, ys, feature_name=feats, params=params, free_raw_data=True)
     full.construct()
     del Xs
     gc.collect()
@@ -355,7 +366,7 @@ def train(overrides: dict | None = None) -> None:
     oof = np.empty(len(keys), dtype=np.float32)
     offset = 0
     for code, country in enumerate(names):
-        for X in feature_batches("train", country, FEATURES, c["predict_batch"]):
+        for X in feature_batches("train", country, feats, c["predict_batch"]):
             fb = pair_fold[offset:offset + len(X)]
             for f in range(v["n_folds"]):
                 m = fb == f
@@ -391,7 +402,7 @@ def train(overrides: dict | None = None) -> None:
                         for n in rep_ents["country_name"].unique()},
         "per_k_bucket": {int(b): float(f_rep[k_bucket(rep_ents["k"]) == b].mean())
                          for b in np.unique(k_bucket(rep_ents["k"]))},
-        "features": FEATURES, "config": c,
+        "features": feats, "config": c,
     }
     with open(run_path("metrics.json"), "w", encoding="utf-8") as fh:
         json.dump(metrics, fh, indent=2)
@@ -440,7 +451,7 @@ def predict(name: str) -> None:
     p = np.empty(len(keys), dtype=np.float32)
     offset = 0
     for country in names:
-        for X in feature_batches("test", country, FEATURES, c["predict_batch"]):
+        for X in feature_batches("test", country, metrics.get("features", FEATURES), c["predict_batch"]):
             p[offset:offset + len(X)] = np.mean(
                 [b.predict(X, num_threads=os.cpu_count()) for b in boosters], axis=0)
             offset += len(X)

@@ -193,3 +193,36 @@ def test_xgb_wrapper_and_combine():
     m = {"lgb": np.array([0.2, 0.8], dtype=np.float32), "xgb": np.array([0.4, 0.6], dtype=np.float32)}
     np.testing.assert_allclose(combine_members(m, "mean"), [0.3, 0.7])
     assert combine_members(m, "xgb") is m["xgb"]
+
+
+def test_subsample_pairs_seeded_subset_in_order():
+    from ber.neural.train_biencoder import subsample_pairs
+    pairs = pd.DataFrame({"country": np.zeros(100, np.int8), "doc_row": np.arange(100)})
+    assert subsample_pairs(pairs, 0, 1) is pairs                  # 0 = all
+    assert subsample_pairs(pairs, 500, 1) is pairs                # more than available = all
+    a, b = subsample_pairs(pairs, 30, 1), subsample_pairs(pairs, 30, 1)
+    assert len(a) == 30 and a.equals(b)                           # seeded
+    assert a["doc_row"].is_monotonic_increasing and a.index.tolist() == list(range(30))
+
+
+def test_gen_number_features_zero_padding_and_generator_edits():
+    from ber.features import _gen_number_features
+    f = _gen_number_features(["3017 120", "2120", "5609", "3404", "", "129"],
+                             ["003017 120", "120", "8609", "3406", "12", ""])
+    assert f["zhouse_state"].tolist() == [1, -1, -1, -1, 0, 0]      # zero padding no longer a conflict
+    assert f["znum_only_rec"].tolist()[:4] == [0, 1, 1, 1]
+    assert f["znum_min_edit"].tolist() == [0, 1, 1, 1, -1, -1]
+    assert f["znum_affix"].tolist()[:4] == [0, 1, 0, 0]            # dropped leading digit: 2120 -> 120
+    assert abs(f["znum_min_rel"][3] - 2 / 3406) < 1e-6
+
+
+def test_name_edit_features_separate_filler_from_content_swaps():
+    from ber.features import _name_edit_features
+    f = _name_edit_features(["guru energy private limited", "platinum meshflow", "gomez charles llc",
+                             "rodriguez ingredients llc"],
+                            ["guru media private limited", "platinum meshflow llc center", "gomezcharles com",
+                             "rodriguez ingredeints"])
+    assert f["nm_sub"].tolist() == [1, 0, 1, 0]                    # content swap vs filler / typo
+    assert f["nm_ins"].tolist()[:2] == [1, 0] and f["nm_del"].tolist()[3] == 0
+    assert f["nm_content_cov"][1] == 1.0 and f["nm_content_cov"][0] == 0.5
+    assert f["nm_concat_sim"][2] == 1.0                            # domain form of the same name

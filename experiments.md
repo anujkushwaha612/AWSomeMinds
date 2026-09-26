@@ -358,3 +358,62 @@ Ollama server) checks the allow-list, selects the threshold band, caches answers
 fits the combiner, measures on a held-out fold and writes the test TSVs (the validator then rejects the
 slice for missing S1 rows, as expected).
 **Gates (to fill in):** ensemble chosen ___ (tuning gain ___) | LLM fold-0 judged delta / CI ___ → KEEP?
+
+---
+
+## E6 — Generator forensics: how the noise is made, and which baseline errors it explains (2026-09-26)
+
+Sample: 20,000 fold-0 S1 entities, their 69,495 true pairs (raw text), plus 400 false positives (FP) and
+400 found-but-rejected true pairs (REJ) per country from the baseline (T = 0.65, arbitration).
+Scripts: [experiments/e6_sample_pairs.py](experiments/e6_sample_pairs.py),
+[experiments/e6_dump_errors.py](experiments/e6_dump_errors.py); the ratios below were computed on their outputs.
+
+**No leak, no identical S1 texts.** No two S1s of a country share normalized name + address.
+
+**Noise seen in true pairs.** Names: typos incl. OCR-style swaps (`Gl0bal`, `8est`), duplicated words, legal
+suffix added/dropped, inserted generic words (top: `com`, `ltd`, `center`, `services`, `inc`, `the`, `dr`, `sri`,
+`shri`, `smt`, `formerly`, `dba`, `www`), dropped generic words (`limited`, `llc`, `private`, `group`, `india`,
+`associates`, `care`, `clinic`, `health`), domain forms (`gomezcharles.com`), junk prefixes/suffixes (`--`, `***`,
+`#45459`), accents, full Indic-script transliteration. Addresses: reordered components, `<NULL>`, state full
+names / codes / native script (`महाराष्ट्र`), old city names (Madras, Bombay), `CDP` / `CITY` suffixes, and
+**house numbers changed** (digit dropped 2120→120, digit replaced 5609→8609, small shifts 3041→3025).
+
+| Measurement | True pairs | FP | REJ |
+|---|---|---|---|
+| Record address has a zero-padded number (`003017`) | 5.2% | 3.1% | **20.0%** |
+| Name: a content word **substituted** (`guru media` vs `guru energy`) | 4.1% | **15.2%** | 5.2% |
+| Name: content word inserted only | 6.4% | **15.2%** | 8.4% |
+| Name: no S1 token at all (random trade name `NEXUMBRA`, domain) | 6.2% | 7.2% | 11.3% |
+| Address: record address empty | 4.4% | **22.0%** | 16.1% |
+| Address: house number 1 edit off | 3.3% | 6.9% | **16.9%** |
+| Address: house numbers conflict | 1.4% | 4.4% | **9.1%** |
+| Address: all record numbers present in S1 | 71.3% | 37.8% | 29.0% |
+
+(Name rows: Latin-script names; noise vocabulary mined on one half of the entities, measured on the other.)
+
+**Ambiguity ceiling.** 1.54% of true pairs have an empty record address and a parent name shared by >1 S1
+(a chain): 5.3% of matched entities contain such a pair. Losing one such pair costs an entity ~0.075 F0.5,
+so the best reachable macro F0.5 is roughly **0.995–0.996**, not 1.0 [estimate].
+
+**Verdict / fixes (not yet built).**
+1. Normalization: strip leading zeros of numbers (targets the 20% of REJ with zero padding).
+2. Number features that treat the generator's edits as noise, not conflicts: min digit edit distance,
+   min relative numeric difference, "record number is a prefix / suffix of an S1 number".
+3. Name-edit features from the mined noise vocabulary: counts of substituted / inserted / deleted *content*
+   tokens (generic words excluded), trade-name flag (no shared token), domain-concatenation match.
+4. Empty-address records: keep them a separate regime in the decision (22% of FPs).
+Expected gain on fold 0 [H]: REJ 0.021 → recover 0.004–0.008; FP 0.015 → recover 0.003–0.006.
+
+**E6 ablation (measured, 2026-09-26).** [experiments/e6_ablation.py](experiments/e6_ablation.py): baseline
+LightGBM on baseline candidates; 150k train entities (folds 2–4), 50k tune (fold 1), 100k report (fold 0).
+
+| Features | Fold-0 macro F0.5 | Δ vs baseline (95% CI) |
+|---|---|---|
+| baseline `FEATURES` | 0.95000 | – |
+| + `GEN_FEATURES` (zero-stripped numbers, name edits) | 0.96124 | +0.0112 [+0.0106, +0.0119] |
+| + GEN + `ADDR_FEATURES` (canonical address coverage) | 0.96199 | +0.0120 |
+| **+ GEN + `CHAIN_FEATURES` (S1s sharing the name)** | **0.96511** | **+0.0151** (vs GEN +0.0039 [+0.0035, +0.0042]) |
+| + GEN + ADDR + CHAIN | 0.96402 | +0.0140 |
+
+**Verdict:** KEEP GEN + CHAIN (baseline via `run_gen.ps1` / `ber.gen_augment`, and v5 `FEATURES_V5`); DROP ADDR
+(small alone, negative with CHAIN). Noise vocabulary: [experiments/e6_mine_vocab.py](experiments/e6_mine_vocab.py) (fold 3).

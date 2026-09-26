@@ -1,7 +1,7 @@
 """A4: streaming dense search with the fine-tuned encoder (GPU), per split and country.
 
-For one country, all embeddings stay on the GPU (largest: US train 7.5M x 768 fp16
-~ 11.5 GB); nothing is written except results:
+For one country, S1 embeddings stay on the GPU and one record source at a time joins
+them (largest: US train S1 + S3, 4.5M x 768 fp16 ~ 6.9 GB; fits a 16 GB T4); nothing is written except results:
   * record-side: top-``k_rec`` S1 for every S2/S3 record          -> drank_rec
   * S1-side:     top-``k_s1`` records per source for every S1       -> drank_s1
   * cosine for every existing TF-IDF candidate, in the row order of the
@@ -69,17 +69,28 @@ def run_country(enc, split: str, country: str, log=print) -> None:
         return
     t0 = time.time()
     st = country_store(split, country, cols=["name_n", "addr_n"])
-    E = {s: enc.encode(store_texts(st, s)) for s in (1, 2, 3)}
-    log(f"[dense {split}/{country}] encoded S1 {st.n(1):,} S2 {st.n(2):,} S3 {st.n(3):,} "
-        f"in {time.time() - t0:.0f}s")
+    tf = pq.read_table(artifact_path(vdir("tfidf"), split, f"{country}.parquet"),
+                       columns=["src", "doc_row", "s1_row"]).to_pandas()
+    for s, n in ((1, "s1_row"), (2, "doc_row"), (3, "doc_row")):     # row universes must agree
+        rows = tf[n] if s == 1 else tf.loc[tf["src"] == s, n]
+        if len(rows) and rows.max() >= st.n(s):
+            raise ValueError(f"{split}/{country}: TF-IDF rows index beyond the store (S{s}); "
+                             f"the TF-IDF run and v5.limit disagree")
+    cos = np.empty(len(tf), dtype=np.float32)
+    # Only S1 and one record source are on the GPU at a time (US train: ~5 GB instead of
+    # 11.5 GB for all three), so the search fits a 16 GB card (Kaggle T4).
+    E1 = enc.encode(store_texts(st, 1))
+    log(f"[dense {split}/{country}] encoded S1 {st.n(1):,} in {time.time() - t0:.0f}s")
     parts = []
     for src in (2, 3):
         t = time.time()
-        ri, rs = topk_tiles(E[src], E[1], c["k_rec"], c["tile_gb"])
+        Es = enc.encode(store_texts(st, src))
+        log(f"    encoded S{src} {st.n(src):,} in {time.time() - t:.0f}s")
+        ri, rs = topk_tiles(Es, E1, c["k_rec"], c["tile_gb"])
         rec = pd.DataFrame({"doc_row": np.repeat(np.arange(len(ri), dtype=np.int32), ri.shape[1]),
                             "s1_row": ri.ravel(), "cos": rs.ravel(),
                             "drank_rec": np.tile(np.arange(ri.shape[1], dtype=np.int8), len(ri))})
-        si, ss = topk_tiles(E[1], E[src], c["k_s1"], c["tile_gb"])
+        si, ss = topk_tiles(E1, Es, c["k_s1"], c["tile_gb"])
         s1s = pd.DataFrame({"s1_row": np.repeat(np.arange(len(si), dtype=np.int32), si.shape[1]),
                             "doc_row": si.ravel(), "cos_s1": ss.ravel(),
                             "drank_s1": np.tile(np.arange(si.shape[1], dtype=np.int8), len(si))})
@@ -89,28 +100,21 @@ def run_country(enc, split: str, country: str, log=print) -> None:
         m["drank_s1"] = m["drank_s1"].fillna(-1).astype(np.int8)
         m["src"] = np.int8(src)
         parts.append(m[["src", "doc_row", "s1_row", "cos", "drank_rec", "drank_s1"]])
+        # cosine for every TF-IDF candidate of this source, in file order
+        mm = (tf["src"] == src).to_numpy()
+        cos[mm] = pair_cos(Es, E1, tf.loc[mm, "doc_row"].to_numpy(), tf.loc[mm, "s1_row"].to_numpy())
+        del Es
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         log(f"    S{src}: {len(rec):,} record-side + {len(s1s):,} S1-side -> {len(m):,} pairs "
             f"in {time.time() - t:.0f}s")
     dense = pd.concat(parts, ignore_index=True).astype({"doc_row": np.int32, "s1_row": np.int32})
-
-    # cosine for every TF-IDF candidate, in file order
-    tf = pq.read_table(artifact_path(vdir("tfidf"), split, f"{country}.parquet"),
-                       columns=["src", "doc_row", "s1_row"]).to_pandas()
-    for s, n in ((1, "s1_row"), (2, "doc_row"), (3, "doc_row")):     # row universes must agree
-        rows = tf[n] if s == 1 else tf.loc[tf["src"] == s, n]
-        if len(rows) and rows.max() >= st.n(s):
-            raise ValueError(f"{split}/{country}: TF-IDF rows index beyond the store (S{s}); "
-                             f"the TF-IDF run and v5.limit disagree")
-    cos = np.empty(len(tf), dtype=np.float32)
-    for src in (2, 3):
-        mm = (tf["src"] == src).to_numpy()
-        cos[mm] = pair_cos(E[src], E[1], tf.loc[mm, "doc_row"].to_numpy(), tf.loc[mm, "s1_row"].to_numpy())
     ensure_parent(out_pq)
     dense.to_parquet(out_pq + ".tmp", index=False)
     np.save(out_np + ".tmp.npy", cos)
     os.replace(out_pq + ".tmp", out_pq)
     os.replace(out_np + ".tmp.npy", out_np)
-    del E
+    del E1
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     log(f"[dense {split}/{country}] done in {time.time() - t0:.0f}s: {len(dense):,} dense pairs "

@@ -112,6 +112,20 @@ def main() -> None:
         print(f"SUGGESTION: training exceeds {budget_h:.0f} h -> set v5.neural.n_pairs to ~{suggest:,} "
               f"(or use intfloat/multilingual-e5-small)")
 
+    # measurements for tools that size the run themselves (kaggle/run_gpu.py)
+    import json
+    from ..config import artifact_path, ensure_parent
+    from .common import vdir
+    out = artifact_path(vdir("neural"), "env_check.json")
+    ensure_parent(out)
+    json.dump({"gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu",
+               "enc_texts_per_s": enc_rate, "train_steps_per_s": step_rate, "batch_size": B,
+               "peak_vram_gb": peak,
+               "vram_gb": torch.cuda.get_device_properties(0).total_memory / 2**30 if torch.cuda.is_available() else 0.0,
+               "n_pairs_available": data_sizes()[0], "n_texts": n_texts,
+               "n_texts_train_s1": n_texts_train_s1(), "eval_records": c["eval_records"]},
+              open(out, "w"), indent=2)
+
 
 def n_texts_train_s1() -> int:
     """Rows of train S1 (the recall gate encodes all of them)."""
