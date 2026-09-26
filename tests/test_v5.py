@@ -226,3 +226,12 @@ def test_name_edit_features_separate_filler_from_content_swaps():
     assert f["nm_ins"].tolist()[:2] == [1, 0] and f["nm_del"].tolist()[3] == 0
     assert f["nm_content_cov"][1] == 1.0 and f["nm_content_cov"][0] == 0.5
     assert f["nm_concat_sim"][2] == 1.0                            # domain form of the same name
+
+
+def test_decoy_features_separate_phonetic_respelling_from_typo():
+    from ber.features import _decoy_name_features, phonetic_key
+    assert phonetic_key("quantyn") == phonetic_key("kwantyn") and phonetic_key("halcify") == phonetic_key("halkify")
+    f = _decoy_name_features(["quantyn comstock llc", "novel trucking limited", "same name inc", "alpha beta"],
+                             ["kwantyn comstock llc", "novel trucnkng limited", "same name inc", ""])
+    assert f["nm_phonetic"].tolist() == [1, 0, 0, 0]
+    assert f["nm_typo"].tolist() == [0, 1, 0, 0]

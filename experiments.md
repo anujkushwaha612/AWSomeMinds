@@ -417,3 +417,23 @@ LightGBM on baseline candidates; 150k train entities (folds 2–4), 50k tune (fo
 
 **Verdict:** KEEP GEN + CHAIN (baseline via `run_gen.ps1` / `ber.gen_augment`, and v5 `FEATURES_V5`); DROP ADDR
 (small alone, negative with CHAIN). Noise vocabulary: [experiments/e6_mine_vocab.py](experiments/e6_mine_vocab.py) (fold 3).
+
+---
+
+## E7 — Test orphans, residuals of v5-lite, and a decoy signature (2026-09-27)
+
+**E7a** ([experiments/e7_test_orphans.py](experiments/e7_test_orphans.py)): fitting each test record's best-score
+distribution as a mix of train "matched" / "unmatched" records gives an unmatched (orphan) share of **~0.39–0.44
+on test** vs 0.28–0.31 on train (India and US, both sources, both score and name estimates agree). Test carries
+~40% more decoy records per S1, which fits the offline → LB gap (0.011 → 0.008).
+
+**E7b** ([experiments/e7b_residuals.py](experiments/e7b_residuals.py), v5-lite stage 2, fold 0): loss = never
+retrieved **0.0152** + rejected true pairs 0.0070 + false positives 0.0061 (+ pruned 0.00001). 83% of false
+positives are orphan records; 37% of rejected true pairs have an empty record address (2% of accepted ones), mostly
+chain names shared by 2–32 S1s (genuinely ambiguous).
+
+**E7c — decoy signature.** Orphan false positives carry a *phonetic* respelling of an S1 content word
+(`quantyn → kwantyn`, `halcify → halkify`, `ujjatech → ujjatekh`) in **17.5%** of cases vs **0.1–0.2%** of true pairs;
+true-record noise is typo-style. `ber.features.DECOY_FEATURES` (`nm_phonetic`, `nm_typo`, on `name_tr`):
+ablation ([experiments/e7c_decoy_ablation.py](experiments/e7c_decoy_ablation.py), same protocol as E6) on top of
+GEN + CHAIN: 0.96511 → **0.96695, Δ +0.0018 [+0.0015, +0.0021]** → KEEP (in `FEATURES_V5`, i.e. the dense union run).

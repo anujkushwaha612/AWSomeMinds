@@ -285,7 +285,7 @@ def string_block(store, src: int, s1_rows: np.ndarray, doc_rows: np.ndarray,
                  extra: bool = False) -> dict:
     """String/structure features for aligned (S1 row, doc row) arrays of one source.
 
-    ``extra`` adds :data:`STRUCT_FEATURES`, :data:`GEN_FEATURES` and :data:`CHAIN_FEATURES` (v5 union only).
+    ``extra`` adds :data:`STRUCT_FEATURES`, :data:`GEN_FEATURES`, :data:`CHAIN_FEATURES` and :data:`DECOY_FEATURES` (v5 union only).
     """
     def pair(col):
         return store.strings(1, col, s1_rows), store.strings(src, col, doc_rows)
@@ -311,6 +311,7 @@ def string_block(store, src: int, s1_rows: np.ndarray, doc_rows: np.ndarray,
     out["translit_ratio"] = _sim(a, b, fuzz.token_set_ratio)
     if extra:
         out.update(_name_edit_features(a, b))
+        out.update(_decoy_name_features(a, b))
     aa, ba = pair("addr_n")
     out["addr_ratio"] = _sim(aa, ba, fuzz.ratio)
     out["addr_tset"] = _sim(aa, ba, fuzz.token_set_ratio)
@@ -378,3 +379,50 @@ def store_chain_features(store, s1_names: list[str], rec_names: list[str]) -> di
     counts = store._s1_name_counts
     return {"s1_name_freq": pd.Series(s1_names).map(counts).fillna(0).to_numpy(np.int32),
             "rec_name_freq": pd.Series(rec_names).map(counts).fillna(0).to_numpy(np.int32)}
+
+
+# Decoy signature (experiments.md E7b): orphan records that are false positives carry a PHONETIC respelling
+# of a content word of the S1 name (quantyn -> kwantyn, halcify -> halkify) in 17.5% of cases, true pairs in
+# 0.1-0.2%; generator noise on true records is typo-style instead. v5 union only.
+DECOY_FEATURES = ["nm_phonetic", "nm_typo"]
+_PHON = (("qu", "k"), ("kw", "k"), ("ck", "k"), ("ph", "f"), ("kh", "k"), ("x", "ks"), ("c", "k"), ("z", "s"), ("y", "i"),
+         ("w", "v"))
+_REPEAT = re.compile(r"(.)\1+")
+_TRAIL_VOWELS = re.compile(r"[aeiou]+$")
+
+
+def phonetic_key(t: str) -> str:
+    """Crude English phonetic key: c/k/q, ph/f, z/s, y/i, w/v merged, doubled letters and trailing vowels dropped."""
+    for a, b in _PHON:
+        t = t.replace(a, b)
+    t = _REPEAT.sub(r"\1", t)
+    return _TRAIL_VOWELS.sub("", t) or t
+
+
+def _decoy_name_features(a_names: list[str], b_names: list[str]) -> dict:
+    """Per pair: S1 content tokens whose closest record token differs only phonetically / by a typo (``name_tr``)."""
+    n = len(a_names)
+    phon = np.zeros(n, dtype=np.int8)
+    typo = np.zeros(n, dtype=np.int8)
+    for i in range(n):
+        A = {t for t in a_names[i].split() if t not in NOISE_TOKENS and len(t) > 2}
+        B = [t for t in b_names[i].split() if t not in NOISE_TOKENS and len(t) > 2]
+        if not A or not B:
+            continue
+        sb = set(B)
+        p = q = 0
+        for x in A - sb:
+            lim = max(2, len(x) // 3)
+            best, bd = None, lim + 1
+            for y in sb:
+                d = Levenshtein.distance(x, y, score_cutoff=lim)
+                if d < bd:
+                    best, bd = y, d
+            if best is None:
+                continue
+            if phonetic_key(x) == phonetic_key(best):
+                p += 1
+            else:
+                q += 1
+        phon[i], typo[i] = min(p, 127), min(q, 127)
+    return {"nm_phonetic": phon, "nm_typo": typo}
