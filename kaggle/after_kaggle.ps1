@@ -8,6 +8,7 @@
 
 param(
     [string[]]$Results = @(),
+    [switch]$Xgb,
     [string]$Redo = ""
 )
 
@@ -75,7 +76,8 @@ if (Test-Path "artifacts\neural\eval.json") {
 
 # ------------------------------------------------------------------ config: no cross-encoder, no LLM
 $env:BER_CONFIG = (Resolve-Path ".").Path + "\$markers\pipeline.yaml"
-$code = Run-Native $py @("-c", "import yaml; c = yaml.safe_load(open('configs/pipeline.yaml', encoding='utf-8')); c['v5']['cross_encoder']['enabled'] = False; c['v5']['llm']['enabled'] = False; yaml.safe_dump(c, open(r'$env:BER_CONFIG', 'w', encoding='utf-8'), sort_keys=False)")
+$xgbFlag = if ($Xgb) { "True" } else { "False" }   # XGBoost stage-2 member on CPU adds ~1 h; opt in with -Xgb
+$code = Run-Native $py @("-c", "import yaml; c = yaml.safe_load(open('configs/pipeline.yaml', encoding='utf-8')); c['v5']['cross_encoder']['enabled'] = False; c['v5']['llm']['enabled'] = False; c['v5']['xgb']['enabled'] = $xgbFlag; c['v5']['xgb']['device'] = 'cpu'; yaml.safe_dump(c, open(r'$env:BER_CONFIG', 'w', encoding='utf-8'), sort_keys=False)")
 if ($code -ne 0) { Say "could not write $env:BER_CONFIG" "Red"; exit 1 }
 
 # ------------------------------------------------------------------ A5 + B + C on CPU
