@@ -23,13 +23,14 @@ import pyarrow.parquet as pq
 
 from .config import artifact_path, ensure_parent
 from .features import CHAIN_FEATURES, DECOY_FEATURES, FEATURES, GEN_FEATURES, KEY_COLS, STRUCT_FEATURES, retrieval_features, write_features
+from .edit_ops import EDITOP_FEATURES
 from .memory import mem_str
 from .neural.common import country_store, vdir
 from .store import split_countries
 
 DENSE_FEATURES = ["in_tfidf", "cos", "drank_rec", "drank_s1", "in_dense", "dgap_rec",
                   "drank_rec_all", "dgap_s1", "drank_s1_all", "n_retrievers"]
-FEATURES_V5 = FEATURES + DENSE_FEATURES + STRUCT_FEATURES + GEN_FEATURES + CHAIN_FEATURES + DECOY_FEATURES
+FEATURES_V5 = FEATURES + DENSE_FEATURES + STRUCT_FEATURES + GEN_FEATURES + CHAIN_FEATURES + DECOY_FEATURES + EDITOP_FEATURES
 
 
 def _absent_rank() -> int:

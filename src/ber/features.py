@@ -281,11 +281,36 @@ def retrieval_features(cand: pd.DataFrame) -> pd.DataFrame:
     return cand
 
 
+def _py_extra(args) -> dict:
+    """The Python-loop extra features for one slice of pairs (runs in a worker process)."""
+    from .edit_ops import edit_op_features      # local import: edit_ops imports this module
+    a_tr, b_tr, a_dig, b_dig, b_addr = args
+    out = _name_edit_features(a_tr, b_tr)
+    out.update(_decoy_name_features(a_tr, b_tr))
+    out.update(_gen_number_features(a_dig, b_dig))
+    out.update(edit_op_features(a_tr, b_tr, a_dig, b_dig, b_addr))
+    return out
+
+
+def py_extra_features(a_tr, b_tr, a_dig, b_dig, b_addr, pool=None) -> dict:
+    """GEN (numbers, name edits) + DECOY + EDITOP features; split across ``pool`` workers when given."""
+    n = len(a_tr)
+    if pool is None or n < 20_000:
+        return _py_extra((a_tr, b_tr, a_dig, b_dig, b_addr))
+    k = 2 * pool._max_workers
+    bounds = np.linspace(0, n, k + 1).astype(int)
+    parts = [(a_tr[s:e], b_tr[s:e], a_dig[s:e], b_dig[s:e], b_addr[s:e])
+             for s, e in zip(bounds[:-1], bounds[1:]) if e > s]
+    res = list(pool.map(_py_extra, parts))
+    return {key: np.concatenate([r[key] for r in res]) for key in res[0]}
+
+
 def string_block(store, src: int, s1_rows: np.ndarray, doc_rows: np.ndarray,
-                 extra: bool = False) -> dict:
+                 extra: bool = False, pool=None) -> dict:
     """String/structure features for aligned (S1 row, doc row) arrays of one source.
 
-    ``extra`` adds :data:`STRUCT_FEATURES`, :data:`GEN_FEATURES`, :data:`CHAIN_FEATURES` and :data:`DECOY_FEATURES` (v5 union only).
+    ``extra`` adds :data:`STRUCT_FEATURES`, :data:`GEN_FEATURES`, :data:`CHAIN_FEATURES`, :data:`DECOY_FEATURES` and
+    ``ber.edit_ops.EDITOP_FEATURES`` (v5 union only); the Python-loop part runs on ``pool`` when given.
     """
     def pair(col):
         return store.strings(1, col, s1_rows), store.strings(src, col, doc_rows)
@@ -309,9 +334,6 @@ def string_block(store, src: int, s1_rows: np.ndarray, doc_rows: np.ndarray,
     out["nospace_ratio"] = _sim(a, b, fuzz.ratio)
     a, b = pair("name_tr")
     out["translit_ratio"] = _sim(a, b, fuzz.token_set_ratio)
-    if extra:
-        out.update(_name_edit_features(a, b))
-        out.update(_decoy_name_features(a, b))
     aa, ba = pair("addr_n")
     out["addr_ratio"] = _sim(aa, ba, fuzz.ratio)
     out["addr_tset"] = _sim(aa, ba, fuzz.token_set_ratio)
@@ -322,11 +344,13 @@ def string_block(store, src: int, s1_rows: np.ndarray, doc_rows: np.ndarray,
     a, b = pair("addr_digits")
     (out["digit_jacc"], out["house_state"], out["n_digits_s1"],
      out["n_digits_rec"]) = _digit_features(a, b)
-    if extra:
-        out.update(_gen_number_features(a, b))
     del a, b
     script = store.numpy(src, "script")[doc_rows]
     out["rec_indic"] = (script > 0).astype(np.int8)
+    if extra:
+        a, b = pair("name_tr")
+        ad, bd = pair("addr_digits")
+        out.update(py_extra_features(a, b, ad, bd, store.strings(src, "addr_n", doc_rows), pool))
     return out
 
 
@@ -340,6 +364,11 @@ def write_features(cand: pd.DataFrame, store, path: str, chunk: int = 500_000,
     """
     writer = None
     n = len(cand)
+    pool = None
+    if extra:                                  # Python-loop extra features: all but two cores
+        import os
+        from concurrent.futures import ProcessPoolExecutor
+        pool = ProcessPoolExecutor(max_workers=max(1, min(12, (os.cpu_count() or 4) - 2)))
     for start in range(0, n, chunk):
         part = cand.iloc[start:start + chunk]
         blocks = []
@@ -348,7 +377,7 @@ def write_features(cand: pd.DataFrame, store, path: str, chunk: int = 500_000,
             if not m.any():
                 continue
             sub = part[m].reset_index(drop=True)
-            feats = string_block(store, src, sub["s1_row"].to_numpy(), sub["doc_row"].to_numpy(), extra)
+            feats = string_block(store, src, sub["s1_row"].to_numpy(), sub["doc_row"].to_numpy(), extra, pool)
             blocks.append(pd.concat([sub, pd.DataFrame(feats)], axis=1))
         table = pa.Table.from_pandas(pd.concat(blocks, ignore_index=True), preserve_index=False)
         if writer is None:
@@ -359,6 +388,8 @@ def write_features(cand: pd.DataFrame, store, path: str, chunk: int = 500_000,
             log(f"    features {min(start + chunk, n):,}/{n:,}")
     if writer is not None:
         writer.close()
+    if pool is not None:
+        pool.shutdown()
     return n
 
 
@@ -411,10 +442,10 @@ def _decoy_name_features(a_names: list[str], b_names: list[str]) -> dict:
             continue
         sb = set(B)
         p = q = 0
-        for x in A - sb:
+        for x in sorted(A - sb):              # sorted: set order depends on the process hash seed
             lim = max(2, len(x) // 3)
             best, bd = None, lim + 1
-            for y in sb:
+            for y in sorted(sb):
                 d = Levenshtein.distance(x, y, score_cutoff=lim)
                 if d < bd:
                     best, bd = y, d

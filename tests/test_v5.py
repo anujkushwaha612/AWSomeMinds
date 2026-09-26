@@ -235,3 +235,16 @@ def test_decoy_features_separate_phonetic_respelling_from_typo():
                              ["kwantyn comstock llc", "novel trucnkng limited", "same name inc", ""])
     assert f["nm_phonetic"].tolist() == [1, 0, 0, 0]
     assert f["nm_typo"].tolist() == [0, 1, 0, 0]
+
+
+def test_edit_op_features_decoy_vs_noise():
+    from ber.edit_ops import NUM_REL, edit_op_features, num_rel
+    assert num_rel("21346", "1346") == "digit_dropped_first" and num_rel("3404", "3406") == "digit_replaced"
+    assert num_rel("5527", "5529") == "digit_replaced" and num_rel("3041", "3025") == "shift<=100"
+    f = edit_op_features(["zephial tokyo", "gl0bal media", "ram marketing", "ace pizza"],
+                         ["zephiala tokyo pvt", "global media dba ace", "ram marketing", "ace pizza"],
+                         ["745", "12", "003017", "100"], ["745", "12", "3017", "95"], ["745 12th ave", "x", "3017 st", "15 rd"])
+    assert f["eo_appended"].tolist()[0] == 1 and f["eo_legal_ins"].tolist()[0] == 1
+    assert f["eo_ocr_rep"].tolist()[1] == 1 and f["eo_dba"].tolist()[1] == 1
+    assert f["eo_house_rel"].tolist()[2] == NUM_REL.index("equal")      # zero padding stripped
+    assert f["eo_house_rel"].tolist()[3] == NUM_REL.index("shift<=10")

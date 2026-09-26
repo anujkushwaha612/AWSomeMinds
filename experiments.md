@@ -437,3 +437,23 @@ chain names shared by 2–32 S1s (genuinely ambiguous).
 true-record noise is typo-style. `ber.features.DECOY_FEATURES` (`nm_phonetic`, `nm_typo`, on `name_tr`):
 ablation ([experiments/e7c_decoy_ablation.py](experiments/e7c_decoy_ablation.py), same protocol as E6) on top of
 GEN + CHAIN: 0.96511 → **0.96695, Δ +0.0018 [+0.0015, +0.0021]** → KEEP (in `FEATURES_V5`, i.e. the dense union run).
+
+**E9 — generator edit operations (likelihood-ratio scan).** [experiments/e9_edit_ops.py](experiments/e9_edit_ops.py):
+in the confusable zone (baseline_gen OOF p ≥ 0.3), 40k true pairs vs 40k decoys (orphan records with their best-p
+S1), learned on **folds 3–4 only**. Each pair → atomic descriptors (char edit ops between aligned name tokens,
+word insertions / deletions, zero-stripped house-number relation); LR = P(d | decoy) / P(d | true).
+
+| Decoy fingerprints | LR | Genuine-noise fingerprints | LR |
+|---|---|---|---|
+| record inserts `pvt` / `private` (S1 lacks it) | ~1100 / ~1000 | `dba` / `formerly` / `as` / `doing` inserted | ~0.006–0.016 |
+| `d>p`, `s>z`, `a>x`, `i>u`, `k>c`, `l>t`, `a>i` letter swaps | 50–335 | name only reordered / identical / `.com` | 0.12–0.14 |
+| one letter appended (`zephial → zephiala`) | ~200–600 | OCR swaps `o>0`, `l>1`, `s>5`, `b>8`, `g>6` | ~0.4 |
+| house number: digit dropped mid / digit added / shift ≤ 10 | 13–67 | house number equal | 0.48 |
+
+Features `ber.edit_ops.EDITOP_FEATURES` (naive-Bayes `eo_llr` from the versioned table `configs/E9_lr_table.json`,
+plus decoy-swap / OCR / inserted-legal / appended / DBA counts and number-relation codes). Ablation
+([experiments/e9_editops_ablation.py](experiments/e9_editops_ablation.py); train fold 2 only, tune fold 1, report
+fold 0) on top of GEN + CHAIN + DECOY: 0.96687 → **0.97112, Δ +0.0043 [+0.0039, +0.0046]** (cap of 400 trees hit)
+→ KEEP (in `FEATURES_V5`). Fix found on the way: token matching iterated Python sets, whose order depends on the
+process hash seed; now sorted, so features are identical across processes (union train vs test, worker pool).
+Union featurization: the Python-loop features run on a process pool (36 µs/pair vs 121 µs serial, identical output).
