@@ -235,3 +235,46 @@ what the code already does, before anything was built. Tags as above.
 US train embeddings are 7.5M × 768 fp16 ≈ 11.5 GB; `tile_gb` lowered to 4 (similarity tile) so dense
 search stays under ~18 GB. Bi-encoder (batch 256, len 64) and cross-encoder (batch 128, len 128) training
 fit comfortably. If CUDA runs out of memory, see GPU_RUNBOOK.md §5.
+
+---
+
+## 10. v5.2 — gaps vs. the best public ER pipelines, and the overfitting guard (2026-09-26)
+
+Compared with Foursquare Location Matching (Kaggle, 1st/4th place), Ditto (VLDB 2021), DoorDash's
+"Retrieve, Match, Escalate" (2026), Splink and Sparkly, our cascade already has the same shape (lexical +
+dense retrieval → GBDT filter → pruning → cross-encoder → GBDT with competition features → calibrated
+decision). Three gaps were closed, each cheap in runtime:
+
+| Gap | Built | Runtime |
+|---|---|---|
+| Ensembling (every Kaggle winner averages model families) | stage 2 = LightGBM + **XGBoost** (GPU `hist`), same folds and early-stopping entities; LightGBM / XGBoost / mean chosen on tuning folds | ~5–15 min on GPU |
+| Escalating the uncertain band to a stronger judge (DoorDash) | **optional** `ber.llm_judge`: ≤ 8B MIT/Apache LLM (allow-list: Qwen3-4B-Instruct-2507, Qwen2.5-7B-Instruct) on the `max_pairs_test` test pairs nearest the threshold, via a **local** Ollama server; off by default | ~30–60 min for 60k pairs (measured by `llm_judge check`) |
+| Candidate depth (Foursquare: 40/record; DoorDash: top 20) | recall gate now reports dense R@1/3/5/10; `k_rec` is raised only if R@10 − R@3 is material | none |
+
+Not built: Ollama **Cloud**. It hosts no ≤ 8B MIT/Apache model (its only ≤ 8B model, Nemotron-3-Nano-4B,
+is under the NVIDIA Open Model License), and the rules forbid external services for resolving entities.
+Two-encoder cross-fitting to train the GBDT on 100% of entities: estimated +0.001–0.003 for a large rework.
+
+### 10.1 Overfitting / complexity guard (applies to every component)
+
+Every learned piece is fitted on one set of entities and judged on another; a component that does not
+beat the simpler pipeline on held-out entities is not used.
+
+| Component | Fitted on | Chosen / tuned on | Judged on | Falls back to |
+|---|---|---|---|---|
+| Bi-encoder, cross-encoder | folds 3–4 entities (records owned by 3–4) | — | fold 0 (recall gate, ablation) | TF-IDF only / `sub_v5_noce` |
+| Stage-1 / stage-2 GBDT | folds 0–2, out-of-fold (3-fold) + early stopping on held-out entities | — | fold 0 | — |
+| Ensemble option | — | folds 1–2; needs ≥ `ensemble_min_gain` (0.0005) over LightGBM | fold 0 (reported) | LightGBM alone |
+| Decision thresholds / expected-F rule | — | folds 1–2 | fold 0 | threshold rule |
+| LLM combiner (3 coefficients) | judged pairs of folds 1–2 | — | fold 0 judged entities, paired bootstrap; used only if CI > 0 | `sub_v5` |
+| Density stress | — | diagnostic only, never changes the submission | — | — |
+
+Residual risks, stated plainly:
+- **Several variants are compared on fold 0** (stage 1, stage 2, noce, LLM). Choosing the best of a few
+  by fold 0 is mildly optimistic; each choice therefore needs a CI > 0, and the private LB is the final
+  judge.
+- **Public-LB overfitting:** the public LB is a subset of test. Do not pick among near-equal submissions by
+  public LB alone; prefer the one whose fold-0 gain has a CI > 0.
+- **Complexity:** each extra model is optional and switchable in `configs/pipeline.yaml`
+  (`cross_encoder.enabled`, `xgb.enabled`, `llm.enabled`). If two variants are statistically tied, submit
+  the simpler one.

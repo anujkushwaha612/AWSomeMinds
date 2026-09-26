@@ -73,7 +73,8 @@ v5:
     k_rec: 3                  # E4: TF-IDF finds 97-98% of found parents at rank 0; ranks 1-2 add 2-3 pp
     k_s1: 5                   # E4: S1-side list per source; per-source true matches <= 5 for 100% (S2) / 99.9% (S3)
     tile_gb: 4.0              # similarity tile size on the GPU (32 GB card: US train embeddings ~11.5 GB + tile)
-    gate_k: 5                 # recall gate: report R@1 / R@3 / R@gate_k
+    gate_k: 10                # recall gate: report dense R@1 / R@3 / R@10 (evidence for raising k_rec;
+                              # Foursquare 1st place fed 40 candidates/record into stage 2, DoorDash retrieves 20)
     weight_decay: 0.01        # [L]
     grad_clip: 1.0            # [L]
     log_every: 100            # training log interval (steps)
@@ -99,6 +100,41 @@ v5:
     score_chunk: 500000       # pairs whose texts are materialized at once (CPU RAM)
     log_every: 100
     checkpoint_every: 2000
+  xgb:
+    # Second model family for the stage-2 ensemble (Kaggle winners ensemble GBDTs). Cross-fitted on the
+    # same folds / early-stopping entities as LightGBM; lgb / xgb / mean is chosen on the TUNING folds.
+    # GPU histogram training when CUDA is visible (~minutes on 10M rows).
+    enabled: true
+    device: auto              # auto | cuda | cpu
+    max_depth: 8              # [L]
+    learning_rate: 0.05
+    min_child_weight: 20
+    subsample: 0.8
+    colsample_bytree: 0.9
+    max_bin: 256
+    num_rounds: 3000
+    early_stopping: 50
+  ensemble_min_gain: 0.0005  # tuning-fold F0.5 an ensemble option must add over LightGBM alone (simpler wins ties)
+  llm:
+    # Optional stage 3 (ber.llm_judge): a <= 8B MIT/Apache instruction model judges the pairs closest to
+    # the decision threshold; its verdict is combined with p2 by a logistic model fitted on tuning folds,
+    # the effect is measured on fold 0 (paired bootstrap), and a separate submission is written.
+    # OFF by default: the rules forbid external services for resolving entities, so run the model
+    # LOCALLY (Ollama on the GPU machine). Ollama Cloud hosts no <= 8B MIT/Apache model today.
+    enabled: false
+    base_url: http://localhost:11434   # Ollama API; a remote URL needs OLLAMA_API_KEY in the environment
+    model: qwen3:4b-instruct-2507-q4_K_M
+    allowed_models:            # prefix -> model card facts; any other model is refused (rule 5)
+      "qwen3:4b-instruct-2507": "Qwen3-4B-Instruct-2507, 4.0B params, Apache-2.0"
+      "qwen2.5:7b-instruct": "Qwen2.5-7B-Instruct, 7.6B params, Apache-2.0"
+    stage2_tag: ""             # stage-2 variant refined: "" (with cross-encoder) or "noce"
+    max_pairs_test: 40000      # test pairs nearest the decision threshold
+    max_pairs_train: 20000     # train pairs in the same band (entity sample, folds 0-2) to fit + measure
+    min_fit_pairs: 200         # fewer judged tuning-fold pairs -> refuse to fit the combiner
+    concurrency: 16            # parallel requests (set OLLAMA_NUM_PARALLEL on the server to match)
+    timeout_s: 60
+    retries: 3
+    think: null                # null = do not send the 'think' flag; false for thinking-capable models
   drop_encoder_records: false # true = remove encoder-seen records from the train GBDT universe (leakage check fallback)
   early_stop_share: 0.1       # share of training ENTITIES held out for LightGBM early stopping
   prune_tau: 0.003            # E4: 14.0 -> 5.05 candidates/S1 at oracle loss 0.00004

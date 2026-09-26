@@ -52,6 +52,10 @@ the config is unchanged. Console log: `artifacts\run_all\console_log.txt`.
 | 17 | stress | CPU | fold-0 F0.5 under test-like density (same rule vs re-tuned) |
 | 18 | predict | CPU | validator `PASS`; `subs\sub_v5` (with cross-encoder) |
 | 19 | france | CPU | per-country prediction statistics |
+| 20 | llm_check / llm_score_test / llm_score_train / llm_apply | local LLM | only if `v5.llm.enabled` (see §6); `[llm apply] ... -> KEEP` means upload `subs\sub_v5_llm` |
+
+Stage 15 (and 11) also log `[ensemble] lgb / xgb / mean` tuning scores and the chosen option; LightGBM alone
+is kept unless another option gains ≥ 0.0005 on the tuning folds.
 
 If step 5 estimates encoder training above ~3 h, stop, set `v5.neural.n_pairs` in
 `configs\pipeline.yaml` to the suggested value, and run again with `-Redo pairs`.
@@ -77,3 +81,23 @@ If step 5 estimates encoder training above ~3 h, stop, set `v5.neural.n_pairs` i
 | Union files built before v5.1 | stage1 warns that the `num_*` features are missing: `-Redo union_train`, `-Redo union_test` to add them |
 | RAM exhausted in stage1 | `max_train_rows: 12000000` |
 | RAM exhausted in baseline/union build | `baseline.workers: 4`, `baseline.feature_chunk: 250000` |
+
+## 6. Optional: local LLM judge (stage 3)
+
+Only MIT/Apache-2.0 models of ≤ 8B parameters are allowed, and entities must not be resolved through an
+external service, so the model runs **on this machine** with Ollama (Ollama Cloud has no allowed model).
+
+```powershell
+# 1. install Ollama from https://ollama.com/download, then in a SEPARATE terminal:
+$env:OLLAMA_NUM_PARALLEL = "16"; ollama serve
+# 2. in the run terminal:
+ollama pull qwen3:4b-instruct-2507-q4_K_M          # Qwen3-4B-Instruct-2507, Apache-2.0, 4.0B
+# 3. configs\pipeline.yaml -> v5.llm.enabled: true   (stage2_tag: "noce" if the CE ablation was not KEEP)
+# 4. run the same run_all command again: only the llm_* stages run
+powershell -ExecutionPolicy Bypass -File .\run_all.ps1 -Cuda cu124 -SkipSetup
+```
+
+`llm_check` prints three sample verdicts and the pairs/s → ETA for `max_pairs_test` + `max_pairs_train`
+(defaults 40k + 20k). If the ETA is too long, lower those two numbers. Answers are cached in
+`artifacts\v5\llm\`, so an interrupted run resumes. Result: `artifacts\v5\llm.json` (`verdict`) and
+`subs\sub_v5_llm\` — upload it only if the verdict is `KEEP`.

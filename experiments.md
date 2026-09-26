@@ -343,3 +343,18 @@ from the bi-encoder checkpoint. Slice scores are meaningless (~20 true pairs per
 - stage-1 gain share of `num_*` features: ___
 - `stage2_noce` fold-0 F0.5: ___ | `stage2` (with CE): ___ | ablation delta / CI: ___ → KEEP if CI > 0
 - LB: sub_v5_noce ___ | sub_v5 ___
+
+---
+
+## E6 — v5.2: XGBoost ensemble member, optional local LLM judge, simplicity guard (2026-09-26)
+
+**Why.** Closing the gaps to the best public ER pipelines (strategy_v5.md §10): model-family ensembling,
+escalation of the threshold band to an LLM (≤ 8B, MIT/Apache, local), recall-gate depth reporting.
+**Guard.** Ensemble options must beat LightGBM on tuning folds by ≥ 0.0005; the LLM stage is used only
+if its fold-0 paired-bootstrap CI > 0; every new stage can be switched off in the config.
+**Verification.** 61 unit tests pass. Smoke run on the slice: stage-2 ensemble (XGBoost on CPU) trains,
+chooses and falls back to LightGBM on a tie; predict loads both members; the LLM stage (against a fake local
+Ollama server) checks the allow-list, selects the threshold band, caches answers (resume re-asks nothing),
+fits the combiner, measures on a held-out fold and writes the test TSVs (the validator then rejects the
+slice for missing S1 rows, as expected).
+**Gates (to fill in):** ensemble chosen ___ (tuning gain ___) | LLM fold-0 judged delta / CI ___ → KEEP?

@@ -156,3 +156,40 @@ def test_ce_band_never_below_prune_tau():
     from ber.config import load_config
     lo, hi = band()
     assert lo >= load_config()["v5"]["prune_tau"] and hi <= 1.0
+
+
+def test_decision_distance_uses_first_and_rest_thresholds():
+    from ber.llm_judge import decision_distance
+    keys = pd.DataFrame({"country": np.int8(0), "src": np.array([2, 2, 2, 3], dtype=np.int8),
+                         "doc_row": np.array([0, 0, 1, 0], dtype=np.int32),
+                         "s1_row": np.array([0, 1, 1, 1], dtype=np.int32)})
+    p = np.array([0.9, 0.95, 0.6, 0.4], dtype=np.float32)
+    d = decision_distance(keys, p, {"threshold": {"t_first": 0.7, "t_rest": 0.5}})
+    assert np.isinf(d[0])                                   # lost arbitration: never predicted
+    np.testing.assert_allclose(d[1:], [0.25, 0.1, 0.1], atol=1e-6)
+
+
+def test_llm_model_allowlist(monkeypatch):
+    import ber.llm_judge as L
+    monkeypatch.setattr(L, "lcfg", lambda: {"model": "qwen3:4b-instruct-2507-q4_K_M",
+                                            "allowed_models": {"qwen3:4b-instruct-2507": "4.0B Apache-2.0"}})
+    assert "Apache" in L.model_card()
+    monkeypatch.setattr(L, "lcfg", lambda: {"model": "gemma4:31b", "allowed_models": {"qwen3:4b": "x"}})
+    with pytest.raises(SystemExit):
+        L.model_card()
+
+
+def test_xgb_wrapper_and_combine():
+    import xgboost as xgb
+    from ber.v5 import XGBModel, combine_members
+    rng = np.random.default_rng(0)
+    X = rng.random((400, 3)).astype(np.float32)
+    y = (X[:, 0] > 0.5).astype(int)
+    d = xgb.DMatrix(X[:300], y[:300])
+    b = xgb.train({"objective": "binary:logistic", "max_depth": 2, "device": "cpu"}, d, 50,
+                  evals=[(xgb.DMatrix(X[300:], y[300:]), "es")], early_stopping_rounds=5, verbose_eval=False)
+    p = XGBModel(b).predict(X, num_threads=1)
+    assert p.shape == (400,) and ((p > 0.5) == y).mean() > 0.9
+    m = {"lgb": np.array([0.2, 0.8], dtype=np.float32), "xgb": np.array([0.4, 0.6], dtype=np.float32)}
+    np.testing.assert_allclose(combine_members(m, "mean"), [0.3, 0.7])
+    assert combine_members(m, "xgb") is m["xgb"]

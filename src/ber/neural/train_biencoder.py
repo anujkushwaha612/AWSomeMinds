@@ -228,7 +228,7 @@ def recall_gate(k: int | None = None) -> dict:
             if not mask.any():
                 continue
             r = ranks[mask]
-            row[name] = {f"dense_R@{j}": float(((r >= 0) & (r < j)).mean()) for j in sorted({1, 3, k})}
+            row[name] = {f"dense_R@{j}": float(((r >= 0) & (r < j)).mean()) for j in sorted({1, 3, 5, k})}
             row[name].update({f"tfidf_R@{j}": float(((tr[mask] >= 0) & (tr[mask] < j)).mean())
                               for j in (1, 3)})
             row[name]["union_R@3+3"] = float((((r >= 0) & (r < 3)) | ((tr[mask] >= 0) & (tr[mask] < 3))).mean())

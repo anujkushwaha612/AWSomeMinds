@@ -260,6 +260,113 @@ def load_models(tag: str) -> list:
     return [lgb.Booster(model_file=run_path("models", f"{tag}_fold{f}.txt")) for f in vcfg()["gbdt_folds"]]
 
 
+# ------------------------------------------------------------------ XGBoost ensemble member (stage 2)
+def xgb_enabled() -> bool:
+    return bool((vcfg().get("xgb") or {}).get("enabled", False))
+
+
+def xgb_device() -> str:
+    """``v5.xgb.device``; 'auto' = CUDA when a GPU is visible (histogram training on GPU)."""
+    dev = (vcfg().get("xgb") or {}).get("device", "auto")
+    if dev != "auto":
+        return dev
+    try:
+        import torch
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except ImportError:
+        return "cpu"
+
+
+class XGBModel:
+    """xgboost Booster with the ``predict(X, num_threads=...)`` call used by :func:`cross_predict_block`."""
+
+    def __init__(self, booster):
+        self.booster = booster
+
+    def predict(self, X, num_threads=None):
+        n = int(self.booster.attr("best_iteration") or self.booster.num_boosted_rounds() - 1) + 1
+        return self.booster.inplace_predict(X, iteration_range=(0, n))
+
+
+def xgb_params() -> dict:
+    xc = vcfg()["xgb"]
+    return {"objective": "binary:logistic", "eval_metric": "logloss", "tree_method": "hist",
+            "device": xgb_device(), "seed": load_config()["seed"], "nthread": os.cpu_count(),
+            **{k: v for k, v in xc.items() if k not in ("enabled", "device", "num_rounds", "early_stopping")}}
+
+
+def xgb_cross_fit(Xtr: np.ndarray, ytr: np.ndarray, fsub: np.ndarray, ent: np.ndarray,
+                  names: list[str], tag: str) -> list:
+    """Same folds and early-stopping ENTITIES as :func:`cross_fit`, with XGBoost (a second model
+    family for the stage-2 ensemble; GPU histogram training when available)."""
+    import xgboost as xgb
+
+    c, xc = vcfg(), vcfg()["xgb"]
+    params = xgb_params()
+    es_u = entity_uniform(ent, load_config()["seed"] + 7)
+    models = []
+    for f in c["gbdt_folds"]:
+        t = time.time()
+        tr = fsub != f
+        es = tr & (es_u < c.get("early_stop_share", 0.1))
+        fit = tr & ~es
+        dtr = xgb.QuantileDMatrix(Xtr[fit], ytr[fit], feature_names=names, max_bin=params.get("max_bin", 256))
+        dva = xgb.QuantileDMatrix(Xtr[es], ytr[es], feature_names=names, ref=dtr)
+        booster = xgb.train(params, dtr, xc["num_rounds"], evals=[(dva, "es")],
+                            early_stopping_rounds=xc["early_stopping"], verbose_eval=False)
+        booster.save_model(run_path("models", f"{tag}_xgb_fold{f}.json"))
+        del dtr, dva
+        gc.collect()
+        models.append(XGBModel(booster))
+        log.info(f"[{tag}/xgb] fold {f}: {int(fit.sum()):,} rows, {booster.best_iteration + 1} trees "
+                 f"({params['device']}), {time.time() - t:.0f}s {mem_str()}")
+        if len(models) == 1:
+            g = booster.get_score(importance_type="total_gain")
+            tot = max(sum(g.values()), 1e-12)
+            top = sorted(g.items(), key=lambda kv: -kv[1])[:20]
+            log.info(f"[{tag}/xgb] gain share: " + ", ".join(f"{k} {v / tot:.3f}" for k, v in top))
+    return models
+
+
+def load_xgb_models(tag: str) -> list:
+    import xgboost as xgb
+
+    out = []
+    for f in vcfg()["gbdt_folds"]:
+        b = xgb.Booster()
+        b.load_model(run_path("models", f"{tag}_xgb_fold{f}.json"))
+        out.append(XGBModel(b))
+    return out
+
+
+def combine_members(members: dict, chosen: str) -> np.ndarray:
+    """p of the chosen ensemble option: one member, or the mean of all members."""
+    if chosen == "mean":
+        return np.mean(np.stack(list(members.values())), axis=0).astype(np.float32)
+    return members[chosen]
+
+
+def choose_ensemble(keys, ents, members: dict, label, rep) -> tuple[np.ndarray, dict, dict]:
+    """Pick LightGBM alone unless another option (XGBoost, or the mean) beats it on the TUNING
+    folds by at least ``v5.ensemble_min_gain``: the simpler model wins ties and noise-sized
+    gains. Fold 0 is only reported, never used to choose."""
+    options = list(members) + (["mean"] if len(members) > 1 else [])
+    scored = {}
+    for o in options:
+        r = tune_rules(keys, ents, combine_members(members, o), label, rep)
+        ch = r[r["chosen"]]
+        scored[o] = (ch["tune_f05"], ch["report_f05"], r)
+        log.info(f"[ensemble] {o}: tune {ch['tune_f05']:.5f} | report fold-{rep} {ch['report_f05']:.5f}")
+    margin = float(vcfg().get("ensemble_min_gain", 0.0005))
+    best = max(options, key=lambda o: scored[o][0])
+    if best != "lgb" and scored[best][0] < scored["lgb"][0] + margin:
+        best = "lgb"
+    info = {"members": list(members), "chosen": best, "min_gain": margin,
+            "options": {o: {"tune_f05": s[0], "report_f05": s[1]} for o, s in scored.items()}}
+    log.info(f"[ensemble] chosen: {best}")
+    return combine_members(members, best), scored[best][2], info
+
+
 # ------------------------------------------------------------------ stage 2 features
 def group_stats(key: np.ndarray, p: np.ndarray, extra: np.ndarray | None = None) -> dict:
     """Per-row statistics of ``p`` within groups of equal ``key`` (sort-based, no pandas).
@@ -526,7 +633,7 @@ def stage2_matrix(split: str, keys: pd.DataFrame, p1: np.ndarray, kept: np.ndarr
 
 
 def stage2(tag: str = "", use_ce: bool | None = None) -> None:
-    """Pruning + stage-2 LightGBM + decision rule; report and save for predict."""
+    """Pruning + stage-2 ensemble (LightGBM [+ XGBoost]) + decision rule; report and save for predict."""
     v = vcfg()
     use_ce = ce_enabled() if use_ce is None else use_ce
     keys, ents = read_keys("train")
@@ -546,18 +653,25 @@ def stage2(tag: str = "", use_ce: bool | None = None) -> None:
     X = stage2_matrix("train", keys, p1, kept, base, ce)
     del ce
     name = "stage2" + sfx(tag)
+    ent_k = entity_key(kk["country"], kk["s1_row"])
     log.info(f"[{name}] pruned to {len(kk):,} pairs (tau {v['prune_tau']}); matrix {X.shape}; "
-             f"cross-encoder features {'ON' if use_ce else 'OFF'} {mem_str()}")
-    models = cross_fit(X[in_gbdt], y[in_gbdt], fold[in_gbdt],
-                       entity_key(kk["country"], kk["s1_row"])[in_gbdt], names, name)
-    p2 = predict_cross(models, X, fold)
+             f"cross-encoder features {'ON' if use_ce else 'OFF'}; xgboost {'ON' if xgb_enabled() else 'OFF'} "
+             f"{mem_str()}")
+    members = {"lgb": predict_cross(cross_fit(X[in_gbdt], y[in_gbdt], fold[in_gbdt], ent_k[in_gbdt],
+                                              names, name), X, fold)}
+    gc.collect()
+    if xgb_enabled():
+        members["xgb"] = predict_cross(xgb_cross_fit(X[in_gbdt], y[in_gbdt], fold[in_gbdt], ent_k[in_gbdt],
+                                                     names, name), X, fold)
     del X
+    gc.collect()
+    p2, rules, ens = choose_ensemble(kk, ents, members, y, v["report_fold"])
+    del members
     np.save(run_path(f"p2_train{sfx(tag)}.npy"), p2)
     np.save(run_path(f"kept_train{sfx(tag)}.npy"), kept)
-    rules = tune_rules(kk, ents, p2, y, v["report_fold"])
     keep = apply_rule(kk, p2, rules)
     res = {"prune_tau": v["prune_tau"], "tag": tag, "use_ce": bool(use_ce), "base_features": base,
-           "features": names, "rules": rules, "report": report(name, kk, ents, keep)}
+           "features": names, "ensemble": ens, "rules": rules, "report": report(name, kk, ents, keep)}
     log.info(f"[{name}] chosen rule {rules['chosen']}: threshold tune {rules['threshold']['tune_f05']:.5f} "
              f"report {rules['threshold']['report_f05']:.5f} | expected-F tune "
              f"{rules['expected_f']['tune_f05']:.5f} report {rules['expected_f']['report_f05']:.5f}")
@@ -565,26 +679,8 @@ def stage2(tag: str = "", use_ce: bool | None = None) -> None:
 
 
 # ------------------------------------------------------------------ predict
-def predict(name: str, tag: str = "") -> None:
-    """Test: prune by p1, stage-2 p2 (mean of fold models), decision, write + validate."""
-    from .submit import finalize_submission
-
-    res = json.load(open(run_path(f"stage2{sfx(tag)}.json")))
-    keys, _ = read_keys("test")
-    p1 = np.load(run_path("p1_test.npy"))
-    if len(p1) != len(keys):
-        raise ValueError(f"p1_test has {len(p1)} rows for {len(keys)} test pairs: rerun stage1")
-    use_ce = res.get("use_ce", False)
-    kept = p1 >= res["prune_tau"]                 # the tau stage 2 was trained with
-    kk = keys[kept].reset_index(drop=True)
-    X = stage2_matrix("test", keys, p1, kept, res.get("base_features", FEATURES_V5),
-                      load_ce("test", len(keys)) if use_ce else None)
-    p2 = predict_cross(load_models("stage2" + sfx(tag)), X, None)
-    del X
-    keep = apply_rule(kk, p2, res["rules"])
-    np.save(run_path(f"p2_test{sfx(tag)}.npy"), p2)
-    np.save(run_path(f"kept_test{sfx(tag)}.npy"), kept)
-    np.save(run_path(f"keep_test{sfx(tag)}.npy"), keep)
+def write_outputs(kk: pd.DataFrame, keep: np.ndarray, log_tag: str) -> tuple[str, str, int, int]:
+    """Stream output/matching_results.tsv and output/candidate_pairs.tsv (candidates = ``kk``)."""
     out_dir = REPO_ROOT / "output"
     out_dir.mkdir(exist_ok=True)
     mpath, cpath = out_dir / "matching_results.tsv", out_dir / "candidate_pairs.tsv"
@@ -602,12 +698,45 @@ def predict(name: str, tag: str = "") -> None:
             n_s1 += st.n(1)
             n_m += a
             n_c += b
-    log.info(f"[predict{sfx(tag)}] {n_s1:,} S1: {n_c:,} candidates ({n_c / n_s1:.2f}/S1), {n_m:,} matches "
+    log.info(f"[{log_tag}] {n_s1:,} S1: {n_c:,} candidates ({n_c / n_s1:.2f}/S1), {n_m:,} matches "
              f"({n_m / n_s1:.2f}/S1) {mem_str()}")
-    finalize_submission(name, str(mpath), str(cpath), offline_metrics=res["report"],
+    return str(mpath), str(cpath), n_m, n_c
+
+
+def test_p2(res: dict, tag: str, keys: pd.DataFrame, p1: np.ndarray, kept: np.ndarray) -> np.ndarray:
+    """Stage-2 p of the pruned test pairs: mean of the fold models of each member, then the ensemble rule."""
+    X = stage2_matrix("test", keys, p1, kept, res.get("base_features", FEATURES_V5),
+                      load_ce("test", len(keys)) if res.get("use_ce", False) else None)
+    ens = res.get("ensemble", {"members": ["lgb"], "chosen": "lgb"})
+    members = {}
+    for m in ens["members"]:
+        models = load_models("stage2" + sfx(tag)) if m == "lgb" else load_xgb_models("stage2" + sfx(tag))
+        members[m] = predict_cross(models, X, None)
+    return combine_members(members, ens["chosen"])
+
+
+def predict(name: str, tag: str = "") -> None:
+    """Test: prune by p1, stage-2 p2 (ensemble of fold models), decision, write + validate."""
+    from .submit import finalize_submission
+
+    res = json.load(open(run_path(f"stage2{sfx(tag)}.json")))
+    keys, _ = read_keys("test")
+    p1 = np.load(run_path("p1_test.npy"))
+    if len(p1) != len(keys):
+        raise ValueError(f"p1_test has {len(p1)} rows for {len(keys)} test pairs: rerun stage1")
+    kept = p1 >= res["prune_tau"]                 # the tau stage 2 was trained with
+    kk = keys[kept].reset_index(drop=True)
+    p2 = test_p2(res, tag, keys, p1, kept)
+    keep = apply_rule(kk, p2, res["rules"])
+    np.save(run_path(f"p2_test{sfx(tag)}.npy"), p2)
+    np.save(run_path(f"kept_test{sfx(tag)}.npy"), kept)
+    np.save(run_path(f"keep_test{sfx(tag)}.npy"), keep)
+    mpath, cpath, n_m, n_c = write_outputs(kk, keep, f"predict{sfx(tag)}")
+    ens = res.get("ensemble", {}).get("chosen", "lgb")
+    finalize_submission(name, mpath, cpath, offline_metrics=res["report"],
                         n_match_pairs=n_m, n_candidate_pairs=n_c,
-                        notes="v5: TF-IDF + fine-tuned e5 union, stage1 GBDT, prune, stage2 GBDT"
-                              + (" + cross-encoder feature" if use_ce else " (no cross-encoder)"))
+                        notes=f"v5: TF-IDF + fine-tuned e5 union, stage1 GBDT, prune, stage2 ({ens})"
+                              + (" + cross-encoder feature" if res.get("use_ce") else " (no cross-encoder)"))
 
 
 # ------------------------------------------------------------------ compare

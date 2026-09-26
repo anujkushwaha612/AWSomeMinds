@@ -132,6 +132,13 @@ Stage "stress"           @("-u", "-m", "ber.gap", "stress", "--run", "v5")
 Stage "predict"          @("-u", "-m", "ber.v5", "predict", "--name", "sub_v5")
 Stage "france"           @("-u", "-m", "ber.gap", "france")
 
+# ------------------------------------------------------------------ optional stage 3: local LLM judge (v5.llm.enabled)
+Stage "llm_check"        @("-u", "-m", "ber.llm_judge", "check")
+Stage "llm_score_test"   @("-u", "-m", "ber.llm_judge", "score", "--split", "test")
+Stage "llm_score_train"  @("-u", "-m", "ber.llm_judge", "score", "--split", "train")
+Stage "llm_apply"        @("-u", "-m", "ber.llm_judge", "apply", "--name", "sub_v5_llm")
+
 Say "`nDONE. Two snapshots: subs\sub_v5_noce (no cross-encoder) and subs\sub_v5 (with; now in output\)." "Green"
 Say "Pick by artifacts\v5\compare.json -> ce_ablation_stage2_vs_stage2_noce (upload sub_v5 only if its CI is > 0)." "Green"
+Say "If v5.llm.enabled: subs\sub_v5_llm exists; upload it only if artifacts\v5\llm.json says verdict KEEP." "Green"
 Say "Offline results: artifacts\v5\stage2.json, artifacts\v5\compare.json, artifacts\neural\eval.json, artifacts\experiments\C*.json" "Green"
