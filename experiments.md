@@ -316,3 +316,45 @@ Also recorded: PyTorch cannot load on the laptop (Smart App Control blocks `c10.
 code was verified only for its CPU parts (smoke run of pairs → union → stage 1 → stage 2 → compare →
 gap on a 20k-row slice with fake dense outputs; leakage checks passed: positives and hard negatives only
 from fold-3/4 S1s, evaluation records only fold 0).
+
+---
+
+## E5 — v5.1: review of an external upgrade list; number-conflict features + cross-encoder (2026-09-26)
+
+**Question.** Which of the proposed upgrades (cross-encoder, digit features, bipartite matching, address
+parsing, geohash, graph expansion, in-batch masking, density-robust thresholds) are worth building, given
+E2/E4?
+
+**Decision (reasoning in strategy_v5.md §9, before any run):** BUILD the cross-encoder (gray zone
+p1 ∈ [prune_tau, 0.995] → stage-2 features `ce`, `ce_minus_rec_other`), BUILD set-level number-conflict
+features (`STRUCT_FEATURES`), REFINE the in-batch mask (identical S1 texts). REJECT linear-sum assignment
+(S1s have many matches; per-record argmax is already optimal under the only exact constraint), address
+parsers / geohash (US-only, LGPL, or needs external data), GT graph expansion (GT is already a complete
+star clustering). Density-stress stays diagnostic.
+
+**Verification so far.** Unit tests for the new pieces (58 pass). Smoke run of every stage on a
+4,000-rows-per-source slice with a tiny random XLM-R (real e5 tokenizer) on CPU: every stage of run_all
+(pairs -> bi-encoder -> dense -> union -> stage1 -> stage2_noce -> cross-encoder pairs/train/score -> stage2 ->
+compare -> stress -> predict -> france) completes; the only error is the validator rejecting the slice for missing
+S1 rows (expected). Union files carry the num_* columns (stage 1 resolved all features); the cross-encoder loads
+from the bi-encoder checkpoint. Slice scores are meaningless (~20 true pairs per country) and are not reported.
+
+**Gates (to fill in from the GPU run):**
+- stage-1 gain share of `num_*` features: ___
+- `stage2_noce` fold-0 F0.5: ___ | `stage2` (with CE): ___ | ablation delta / CI: ___ → KEEP if CI > 0
+- LB: sub_v5_noce ___ | sub_v5 ___
+
+---
+
+## E6 — v5.2: XGBoost ensemble member, optional local LLM judge, simplicity guard (2026-09-26)
+
+**Why.** Closing the gaps to the best public ER pipelines (strategy_v5.md §10): model-family ensembling,
+escalation of the threshold band to an LLM (≤ 8B, MIT/Apache, local), recall-gate depth reporting.
+**Guard.** Ensemble options must beat LightGBM on tuning folds by ≥ 0.0005; the LLM stage is used only
+if its fold-0 paired-bootstrap CI > 0; every new stage can be switched off in the config.
+**Verification.** 61 unit tests pass. Smoke run on the slice: stage-2 ensemble (XGBoost on CPU) trains,
+chooses and falls back to LightGBM on a tie; predict loads both members; the LLM stage (against a fake local
+Ollama server) checks the allow-list, selects the threshold band, caches answers (resume re-asks nothing),
+fits the combiner, measures on a held-out fold and writes the test TSVs (the validator then rejects the
+slice for missing S1 rows, as expected).
+**Gates (to fill in):** ensemble chosen ___ (tuning gain ___) | LLM fold-0 judged delta / CI ___ → KEEP?

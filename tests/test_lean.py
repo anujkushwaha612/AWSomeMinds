@@ -34,9 +34,9 @@ class FakeStore:
 
     def na_text(self, s, start, stop):
         import pyarrow.compute as pc
-        return pc.binary_join_element_wise(self.column(s, "name_n").slice(start, stop - start),
-                                           self.column(s, "addr_n").slice(start, stop - start),
-                                           " ").to_pylist()
+        name = self.column(s, "name_n").slice(start, stop - start)
+        return pc.binary_join_element_wise(name, self.column(s, "addr_n").slice(start, stop - start),
+                                           pa.scalar(" ", type=name.type)).to_pylist()
 
     def numpy(self, s, name):
         return self.column(s, name).to_numpy(zero_copy_only=False)

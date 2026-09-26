@@ -6,7 +6,7 @@ Inputs per split / country:
   artifacts/dense/<split>/<country>_tfidf_cos.npy         cosine of every TF-IDF candidate
 Output: artifacts/union/<split>/<country>.parquet with KEY_COLS, label (train) and
 ``FEATURES_V5`` = the baseline features (TF-IDF score/rank = 0/9 when absent) + dense
-features; entity files are copied unchanged (k and folds do not depend on candidates).
+features + number-conflict features (``STRUCT_FEATURES``); entity files are copied unchanged (k and folds do not depend on candidates).
 
 Run:  python -m ber.union --split train
       python -m ber.union --split test
@@ -22,14 +22,14 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 from .config import artifact_path, ensure_parent
-from .features import FEATURES, KEY_COLS, retrieval_features, write_features
+from .features import FEATURES, KEY_COLS, STRUCT_FEATURES, retrieval_features, write_features
 from .memory import mem_str
 from .neural.common import country_store, vdir
 from .store import split_countries
 
 DENSE_FEATURES = ["in_tfidf", "cos", "drank_rec", "drank_s1", "in_dense", "dgap_rec",
                   "drank_rec_all", "dgap_s1", "drank_s1_all", "n_retrievers"]
-FEATURES_V5 = FEATURES + DENSE_FEATURES
+FEATURES_V5 = FEATURES + DENSE_FEATURES + STRUCT_FEATURES
 
 
 def _absent_rank() -> int:
@@ -138,7 +138,8 @@ def build(split: str, force: bool = False, feature_chunk: int | None = None) -> 
         print(f"[union {split}/{country}] {n_tf:,} TF-IDF + {len(cand) - n_tf:,} dense-only = "
               f"{len(cand):,} pairs ({len(cand) / max(store.n(1), 1):.2f}/S1) {mem_str()}", flush=True)
         ensure_parent(out)
-        write_features(cand, store, out + ".tmp", feature_chunk, log=lambda s: print(s, flush=True))
+        write_features(cand, store, out + ".tmp", feature_chunk, log=lambda s: print(s, flush=True),
+                       extra=True)
         os.replace(out + ".tmp", out)
         shutil.copy2(artifact_path(vdir("tfidf"), split, f"{country}_entities.parquet"),
                      artifact_path(vdir("union"), split, f"{country}_entities.parquet"))

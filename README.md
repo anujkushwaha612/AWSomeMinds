@@ -1,7 +1,8 @@
 # Business Entity Resolution — Amazon ML Challenge 2026
 
-Pipeline: normalization → same-country candidate generation → LightGBM pair scoring →
-entity decision layer. Strategy and gates: [plan.md](plan.md). Data findings:
+Pipeline: normalization → same-country candidate generation (TF-IDF ∪ fine-tuned e5 bi-encoder) →
+LightGBM stage 1 → pruning → cross-encoder on the gray zone → LightGBM stage 2 → entity decision layer.
+Full GPU run: [GPU_RUNBOOK.md](GPU_RUNBOOK.md); design and upgrade review: [strategy_v5.md](strategy_v5.md) §9. Strategy and gates: [plan.md](plan.md). Data findings:
 [phase0_report.md](phase0_report.md).
 
 ## Setup
@@ -58,6 +59,8 @@ Knobs are in `configs/pipeline.yaml` → `baseline:`. To try a variant without o
 | `src/ber/eval/scorer.py` | exact per-entity F0.5 scorer, oracle ceiling, paired bootstrap, strata summary |
 | `src/ber/folds.py` | fold assignment stratified by country x k-bucket |
 | `src/ber/submit.py` | write both TSVs, run the official validator, snapshot to `subs/<name>/` |
+| `src/ber/neural/` | bi-encoder (pairs, fine-tuning, dense search) and cross-encoder (`cross_encoder.py`, strategy_v5.md §9) |
+| `src/ber/union.py`, `src/ber/v5.py`, `src/ber/gap.py` | union candidates + features, stage-1/2 GBDT + decision + ablations, LB-gap diagnostics |
 | `phase0/` | data-analysis scripts behind phase0_report.md §8 |
 | `subs/` | one folder per leaderboard submission (commit, config, metrics) |
 

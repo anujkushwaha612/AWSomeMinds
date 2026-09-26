@@ -10,14 +10,20 @@ Stages (checkpointed under artifacts/v5/):
   stage1   LightGBM on FEATURES_V5            -> p1 (train OOF/mean, test mean)
   stage2   prune pairs with p1 < prune_tau   -> candidate set of the final model;
            stage-2 features from p1 (record / S1 competition, counts vs caps, margins)
-           LightGBM on [FEATURES_V5, p1, STAGE2] -> p2; decision: (T_first, T_rest) grid
+           [+ cross-encoder logit ``ce`` and its record margin, if v5.cross_encoder.enabled]
+           LightGBM on [FEATURES_V5, p1, STAGE2 (, CE)] -> p2; decision: (T_first, T_rest) grid
            vs expected-F0.5 prefix on isotonic-calibrated p2 (the better on tuning folds wins)
   predict  test: stage 1 -> prune -> stage 2 -> decision -> both TSVs, validated, snapshot
-  compare  paired bootstrap on fold-0 entities vs the baseline run
+  compare  paired bootstrap on fold-0 entities: every stage vs the baseline run, and
+           stage2 vs stage2_noce (the cross-encoder ablation) when both exist
+
+``--tag`` keeps several stage-2 variants side by side (files get a ``_<tag>`` suffix);
+``--no-ce`` trains stage 2 without the cross-encoder features.
 
 Run:  python -u -m ber.v5 stage1
+      python -u -m ber.v5 stage2 --tag noce --no-ce
       python -u -m ber.v5 stage2
-      python -u -m ber.v5 predict --name sub03_v5
+      python -u -m ber.v5 predict --name sub03_v5 [--tag noce]
       python -u -m ber.v5 compare
 """
 
@@ -46,7 +52,7 @@ from .union import FEATURES_V5
 STAGE2 = ["p1", "rec_pmax", "rec_p2", "p_minus_rec_other", "rec_prank", "rec_n",
           "s1src_pmax", "s1src_prank", "s1src_n05", "s1src_psum", "p_minus_s1src_other",
           "s1_n05", "s1_pmax_other_src", "s1_n_best"]
-FEATURES_S2 = FEATURES_V5 + STAGE2
+CE_FEATURES = ["ce", "ce_minus_rec_other"]
 log = logging.getLogger("ber.v5")
 
 
@@ -58,6 +64,15 @@ def vcfg() -> dict:
 def run_path(*parts: str) -> str:
     """Outputs of this run: artifacts/<BER_V5_RUN or 'v5'>/."""
     return artifact_path(os.environ.get("BER_V5_RUN") or vdir("v5"), *parts)
+
+
+def sfx(tag: str) -> str:
+    """File suffix of a tagged stage-2 variant ('' for the main one)."""
+    return f"_{tag}" if tag else ""
+
+
+def ce_enabled() -> bool:
+    return bool((vcfg().get("cross_encoder") or {}).get("enabled", False))
 
 
 def feat_path(split: str, country: str, entities: bool = False) -> str:
@@ -90,13 +105,37 @@ def read_keys(split: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     return pd.concat(keys, ignore_index=True), pd.concat(ents, ignore_index=True)
 
 
-def read_matrix(split: str, rows_mask: np.ndarray, batch: int = 1_000_000) -> np.ndarray:
-    """FEATURES_V5 of the selected rows (global row order), as one float32 matrix."""
-    X = np.empty((int(rows_mask.sum()), len(FEATURES_V5)), dtype=np.float32)
+def resolve_features() -> list[str]:
+    """FEATURES_V5 columns present in every union file of both splits.
+
+    Union files built before the number-conflict features existed lack them; the run
+    then goes on without them (loud warning) instead of failing.
+    """
+    have = None
+    for split in ("train", "test"):
+        for country in split_countries(split):
+            names = set(pq.ParquetFile(feat_path(split, country)).schema_arrow.names)
+            have = names if have is None else have & names
+    missing = [f for f in FEATURES_V5 if f not in have]
+    if missing:
+        log.warning(f"WARNING: union files lack {missing}; rebuild them (run_all -Redo union_train, "
+                    f"then union_test) to use these features. Continuing without them.")
+    return [f for f in FEATURES_V5 if f in have]
+
+
+def stage1_features() -> list[str]:
+    """The feature list stage 1 was trained with (stage-2 inputs must match it)."""
+    res = json.load(open(run_path("stage1.json")))
+    return res.get("features", FEATURES_V5)
+
+
+def read_matrix(split: str, rows_mask: np.ndarray, names: list[str], batch: int = 1_000_000) -> np.ndarray:
+    """Columns ``names`` of the selected rows (global row order), as one float32 matrix."""
+    X = np.empty((int(rows_mask.sum()), len(names)), dtype=np.float32)
     off = fill = 0
     for country in split_countries(split):
         pf = pq.ParquetFile(feat_path(split, country))
-        for rb in pf.iter_batches(batch_size=batch, columns=FEATURES_V5):
+        for rb in pf.iter_batches(batch_size=batch, columns=names):
             sel = rows_mask[off:off + rb.num_rows]
             n = int(sel.sum())
             if n:
@@ -174,6 +213,11 @@ def cross_fit(Xtr: np.ndarray, ytr: np.ndarray, fsub: np.ndarray, ent: np.ndarra
         gc.collect()
         log.info(f"[{tag}] fold {f}: {int((tr & ~es).sum()):,} rows, {booster.best_iteration} trees, "
                  f"{time.time() - t:.0f}s {mem_str()}")
+        if len(models) == 1:                  # which features carry the model (evidence for keeping them)
+            g = booster.feature_importance("gain")
+            share = g / max(g.sum(), 1e-12)
+            top = np.argsort(-share)[:20]
+            log.info(f"[{tag}] gain share: " + ", ".join(f"{names[i]} {share[i]:.3f}" for i in top))
     del full
     return models
 
@@ -197,13 +241,14 @@ def predict_cross(models, X: np.ndarray, fold: np.ndarray | None, batch: int = 2
     return p
 
 
-def predict_stream(models, split: str, fold: np.ndarray | None, n: int, batch: int = 1_000_000) -> np.ndarray:
+def predict_stream(models, split: str, fold: np.ndarray | None, n: int, names: list[str],
+                   batch: int = 1_000_000) -> np.ndarray:
     """:func:`cross_predict_block` streamed over the union feature files (low memory)."""
     p = np.empty(n, dtype=np.float32)
     off = 0
     for country in split_countries(split):
         pf = pq.ParquetFile(feat_path(split, country))
-        for rb in pf.iter_batches(batch_size=batch, columns=FEATURES_V5):
+        for rb in pf.iter_batches(batch_size=batch, columns=names):
             M = np.column_stack([rb.column(i).to_numpy(zero_copy_only=False).astype(np.float32)
                                  for i in range(rb.num_columns)])
             p[off:off + len(M)] = cross_predict_block(models, M, None if fold is None else fold[off:off + len(M)])
@@ -213,6 +258,113 @@ def predict_stream(models, split: str, fold: np.ndarray | None, n: int, batch: i
 
 def load_models(tag: str) -> list:
     return [lgb.Booster(model_file=run_path("models", f"{tag}_fold{f}.txt")) for f in vcfg()["gbdt_folds"]]
+
+
+# ------------------------------------------------------------------ XGBoost ensemble member (stage 2)
+def xgb_enabled() -> bool:
+    return bool((vcfg().get("xgb") or {}).get("enabled", False))
+
+
+def xgb_device() -> str:
+    """``v5.xgb.device``; 'auto' = CUDA when a GPU is visible (histogram training on GPU)."""
+    dev = (vcfg().get("xgb") or {}).get("device", "auto")
+    if dev != "auto":
+        return dev
+    try:
+        import torch
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except ImportError:
+        return "cpu"
+
+
+class XGBModel:
+    """xgboost Booster with the ``predict(X, num_threads=...)`` call used by :func:`cross_predict_block`."""
+
+    def __init__(self, booster):
+        self.booster = booster
+
+    def predict(self, X, num_threads=None):
+        n = int(self.booster.attr("best_iteration") or self.booster.num_boosted_rounds() - 1) + 1
+        return self.booster.inplace_predict(X, iteration_range=(0, n))
+
+
+def xgb_params() -> dict:
+    xc = vcfg()["xgb"]
+    return {"objective": "binary:logistic", "eval_metric": "logloss", "tree_method": "hist",
+            "device": xgb_device(), "seed": load_config()["seed"], "nthread": os.cpu_count(),
+            **{k: v for k, v in xc.items() if k not in ("enabled", "device", "num_rounds", "early_stopping")}}
+
+
+def xgb_cross_fit(Xtr: np.ndarray, ytr: np.ndarray, fsub: np.ndarray, ent: np.ndarray,
+                  names: list[str], tag: str) -> list:
+    """Same folds and early-stopping ENTITIES as :func:`cross_fit`, with XGBoost (a second model
+    family for the stage-2 ensemble; GPU histogram training when available)."""
+    import xgboost as xgb
+
+    c, xc = vcfg(), vcfg()["xgb"]
+    params = xgb_params()
+    es_u = entity_uniform(ent, load_config()["seed"] + 7)
+    models = []
+    for f in c["gbdt_folds"]:
+        t = time.time()
+        tr = fsub != f
+        es = tr & (es_u < c.get("early_stop_share", 0.1))
+        fit = tr & ~es
+        dtr = xgb.QuantileDMatrix(Xtr[fit], ytr[fit], feature_names=names, max_bin=params.get("max_bin", 256))
+        dva = xgb.QuantileDMatrix(Xtr[es], ytr[es], feature_names=names, ref=dtr)
+        booster = xgb.train(params, dtr, xc["num_rounds"], evals=[(dva, "es")],
+                            early_stopping_rounds=xc["early_stopping"], verbose_eval=False)
+        booster.save_model(run_path("models", f"{tag}_xgb_fold{f}.json"))
+        del dtr, dva
+        gc.collect()
+        models.append(XGBModel(booster))
+        log.info(f"[{tag}/xgb] fold {f}: {int(fit.sum()):,} rows, {booster.best_iteration + 1} trees "
+                 f"({params['device']}), {time.time() - t:.0f}s {mem_str()}")
+        if len(models) == 1:
+            g = booster.get_score(importance_type="total_gain")
+            tot = max(sum(g.values()), 1e-12)
+            top = sorted(g.items(), key=lambda kv: -kv[1])[:20]
+            log.info(f"[{tag}/xgb] gain share: " + ", ".join(f"{k} {v / tot:.3f}" for k, v in top))
+    return models
+
+
+def load_xgb_models(tag: str) -> list:
+    import xgboost as xgb
+
+    out = []
+    for f in vcfg()["gbdt_folds"]:
+        b = xgb.Booster()
+        b.load_model(run_path("models", f"{tag}_xgb_fold{f}.json"))
+        out.append(XGBModel(b))
+    return out
+
+
+def combine_members(members: dict, chosen: str) -> np.ndarray:
+    """p of the chosen ensemble option: one member, or the mean of all members."""
+    if chosen == "mean":
+        return np.mean(np.stack(list(members.values())), axis=0).astype(np.float32)
+    return members[chosen]
+
+
+def choose_ensemble(keys, ents, members: dict, label, rep) -> tuple[np.ndarray, dict, dict]:
+    """Pick LightGBM alone unless another option (XGBoost, or the mean) beats it on the TUNING
+    folds by at least ``v5.ensemble_min_gain``: the simpler model wins ties and noise-sized
+    gains. Fold 0 is only reported, never used to choose."""
+    options = list(members) + (["mean"] if len(members) > 1 else [])
+    scored = {}
+    for o in options:
+        r = tune_rules(keys, ents, combine_members(members, o), label, rep)
+        ch = r[r["chosen"]]
+        scored[o] = (ch["tune_f05"], ch["report_f05"], r)
+        log.info(f"[ensemble] {o}: tune {ch['tune_f05']:.5f} | report fold-{rep} {ch['report_f05']:.5f}")
+    margin = float(vcfg().get("ensemble_min_gain", 0.0005))
+    best = max(options, key=lambda o: scored[o][0])
+    if best != "lgb" and scored[best][0] < scored["lgb"][0] + margin:
+        best = "lgb"
+    info = {"members": list(members), "chosen": best, "min_gain": margin,
+            "options": {o: {"tune_f05": s[0], "report_f05": s[1]} for o, s in scored.items()}}
+    log.info(f"[ensemble] chosen: {best}")
+    return combine_members(members, best), scored[best][2], info
 
 
 # ------------------------------------------------------------------ stage 2 features
@@ -280,6 +432,24 @@ def stage2_features(keys: pd.DataFrame, p: np.ndarray) -> pd.DataFrame:
     cnt = pd.Series(((c << 40) | s1)[best_rows]).value_counts()
     out["s1_n_best"] = cnt.reindex((c << 40) | s1).fillna(0).to_numpy(np.int16)
     return out[STAGE2]
+
+
+def ce_features(keys: pd.DataFrame, ce: np.ndarray) -> pd.DataFrame:
+    """Cross-encoder logit and its margin to the record's best OTHER scored S1.
+
+    NaN where the pair was not scored (p1 outside the band) or the record has no other
+    scored candidate; LightGBM routes missing values on its own.
+    """
+    ce = np.asarray(ce, dtype=np.float64)
+    margin = np.full(len(ce), np.nan)
+    ok = np.isfinite(ce)
+    if ok.any():
+        rec = (keys["country"].to_numpy(np.int64) << 40) | (keys["src"].to_numpy(np.int64) << 32) \
+            | keys["doc_row"].to_numpy(np.int64)
+        g = group_stats(rec[ok], ce[ok])
+        v = ce[ok]
+        margin[ok] = np.where(g["n"] > 1, np.where(g["rank"] == 0, v - g["second"], v - g["max"]), np.nan)
+    return pd.DataFrame({"ce": ce.astype(np.float32), "ce_minus_rec_other": margin.astype(np.float32)})
 
 
 # ------------------------------------------------------------------ decision rules
@@ -407,15 +577,16 @@ def stage1() -> None:
     log.info(f"[stage1] {len(keys):,} union pairs; training rows {int(train_mask.sum()):,} "
              f"(gbdt folds {v['gbdt_folds']}, entity share {frac:.3f}) {mem_str()}")
     ent_all = entity_key(keys["country"], keys["s1_row"])
-    models = cross_fit(read_matrix("train", train_mask), y[train_mask], fold[train_mask],
-                       ent_all[train_mask], FEATURES_V5, "stage1")
+    names = resolve_features()
+    models = cross_fit(read_matrix("train", train_mask, names), y[train_mask], fold[train_mask],
+                       ent_all[train_mask], names, "stage1")
     gc.collect()
-    p1 = predict_stream(models, "train", fold, len(keys))
+    p1 = predict_stream(models, "train", fold, len(keys), names)
     np.save(run_path("p1_train.npy"), p1)
     dec = Decider(keys, p1)
     rules = tune_rules(keys, ents, p1, y, v["report_fold"])
     keep = apply_rule(keys, p1, rules)
-    res = {"stage1_rules": rules, "stage1_report": report("stage1", keys, ents, keep)}
+    res = {"features": names, "stage1_rules": rules, "stage1_report": report("stage1", keys, ents, keep)}
     # pruning curve on fold 0 (oracle loss vs candidate count)
     rep_mask = (ents["fold"] == v["report_fold"]).to_numpy()
     sc = EntityScorer(ents, keys, rep_mask)
@@ -429,26 +600,49 @@ def stage1() -> None:
     log.info("[stage1] prune curve " + json.dumps(curve))
     del dec
     tkeys, _ = read_keys("test")                                       # test p1: mean of fold models
-    np.save(run_path("p1_test.npy"), predict_stream(models, "test", None, len(tkeys)))
+    np.save(run_path("p1_test.npy"), predict_stream(models, "test", None, len(tkeys), names))
     json.dump(res, open(run_path("stage1.json"), "w"), indent=2, default=float)
     log.info(f"[stage1] done {mem_str()}")
 
 
 # ------------------------------------------------------------------ stage 2
-def stage2_matrix(split: str, keys: pd.DataFrame, p1: np.ndarray, kept: np.ndarray) -> np.ndarray:
-    """[FEATURES_V5, STAGE2] for the pruned rows (STAGE2 computed among pruned rows only)."""
-    X = read_matrix(split, kept)
-    s2 = stage2_features(keys[kept].reset_index(drop=True), p1[kept]).to_numpy(np.float32)
-    return np.hstack([X, s2])
+def load_ce(split: str, n: int) -> np.ndarray:
+    """Cross-encoder logits of every union pair of ``split`` (NaN outside the band)."""
+    path = run_path(f"ce_{split}.npy")
+    if not os.path.exists(path):
+        raise SystemExit(f"{path} is missing: run `python -m ber.neural.cross_encoder score --split {split}`, "
+                         f"or set v5.cross_encoder.enabled: false (or pass --no-ce)")
+    ce = np.load(path)
+    if len(ce) != n:
+        raise ValueError(f"{path} has {len(ce)} rows for {n} union pairs: rerun the cross-encoder scoring")
+    return ce
 
 
-def stage2() -> None:
-    """Pruning + stage-2 LightGBM + decision rule; report and save for predict."""
+def stage2_matrix(split: str, keys: pd.DataFrame, p1: np.ndarray, kept: np.ndarray,
+                  base: list[str], ce: np.ndarray | None = None) -> np.ndarray:
+    """[base features, STAGE2 (, CE_FEATURES)] for the pruned rows.
+
+    STAGE2 and the CE margin are computed among the pruned rows only (the rows the
+    final model scores).
+    """
+    kk = keys[kept].reset_index(drop=True)
+    parts = [read_matrix(split, kept, base), stage2_features(kk, p1[kept]).to_numpy(np.float32)]
+    if ce is not None:
+        parts.append(ce_features(kk, ce[kept]).to_numpy(np.float32))
+    return np.hstack(parts)
+
+
+def stage2(tag: str = "", use_ce: bool | None = None) -> None:
+    """Pruning + stage-2 ensemble (LightGBM [+ XGBoost]) + decision rule; report and save for predict."""
     v = vcfg()
+    use_ce = ce_enabled() if use_ce is None else use_ce
     keys, ents = read_keys("train")
     p1 = np.load(run_path("p1_train.npy"))
     if len(p1) != len(keys):
         raise ValueError(f"p1_train has {len(p1)} rows for {len(keys)} train pairs: rerun stage1")
+    base = stage1_features()
+    names = base + STAGE2 + (CE_FEATURES if use_ce else [])
+    ce = load_ce("train", len(keys)) if use_ce else None
     kept = p1 >= v["prune_tau"]
     kk = keys[kept].reset_index(drop=True)
     y = kk["label"].to_numpy()
@@ -456,42 +650,37 @@ def stage2() -> None:
     in_gbdt = np.isin(fold, v["gbdt_folds"])
     if v["drop_encoder_records"]:
         in_gbdt &= ~encoder_seen(kk)
-    X = stage2_matrix("train", keys, p1, kept)
-    log.info(f"[stage2] pruned to {len(kk):,} pairs (tau {v['prune_tau']}); matrix {X.shape} {mem_str()}")
-    models = cross_fit(X[in_gbdt], y[in_gbdt], fold[in_gbdt],
-                       entity_key(kk["country"], kk["s1_row"])[in_gbdt], FEATURES_S2, "stage2")
-    p2 = predict_cross(models, X, fold)
-    np.save(run_path("p2_train.npy"), p2)
-    np.save(run_path("kept_train.npy"), kept)
-    rules = tune_rules(kk, ents, p2, y, v["report_fold"])
+    X = stage2_matrix("train", keys, p1, kept, base, ce)
+    del ce
+    name = "stage2" + sfx(tag)
+    ent_k = entity_key(kk["country"], kk["s1_row"])
+    log.info(f"[{name}] pruned to {len(kk):,} pairs (tau {v['prune_tau']}); matrix {X.shape}; "
+             f"cross-encoder features {'ON' if use_ce else 'OFF'}; xgboost {'ON' if xgb_enabled() else 'OFF'} "
+             f"{mem_str()}")
+    members = {"lgb": predict_cross(cross_fit(X[in_gbdt], y[in_gbdt], fold[in_gbdt], ent_k[in_gbdt],
+                                              names, name), X, fold)}
+    gc.collect()
+    if xgb_enabled():
+        members["xgb"] = predict_cross(xgb_cross_fit(X[in_gbdt], y[in_gbdt], fold[in_gbdt], ent_k[in_gbdt],
+                                                     names, name), X, fold)
+    del X
+    gc.collect()
+    p2, rules, ens = choose_ensemble(kk, ents, members, y, v["report_fold"])
+    del members
+    np.save(run_path(f"p2_train{sfx(tag)}.npy"), p2)
+    np.save(run_path(f"kept_train{sfx(tag)}.npy"), kept)
     keep = apply_rule(kk, p2, rules)
-    res = {"prune_tau": v["prune_tau"], "rules": rules, "report": report("stage2", kk, ents, keep)}
-    log.info(f"[stage2] chosen rule {rules['chosen']}: threshold tune {rules['threshold']['tune_f05']:.5f} "
+    res = {"prune_tau": v["prune_tau"], "tag": tag, "use_ce": bool(use_ce), "base_features": base,
+           "features": names, "ensemble": ens, "rules": rules, "report": report(name, kk, ents, keep)}
+    log.info(f"[{name}] chosen rule {rules['chosen']}: threshold tune {rules['threshold']['tune_f05']:.5f} "
              f"report {rules['threshold']['report_f05']:.5f} | expected-F tune "
              f"{rules['expected_f']['tune_f05']:.5f} report {rules['expected_f']['report_f05']:.5f}")
-    json.dump(res, open(run_path("stage2.json"), "w"), indent=2, default=float)
+    json.dump(res, open(run_path(f"stage2{sfx(tag)}.json"), "w"), indent=2, default=float)
 
 
 # ------------------------------------------------------------------ predict
-def predict(name: str) -> None:
-    """Test: prune by p1, stage-2 p2 (mean of fold models), decision, write + validate."""
-    from .submit import finalize_submission
-
-    v = vcfg()
-    res = json.load(open(run_path("stage2.json")))
-    keys, _ = read_keys("test")
-    p1 = np.load(run_path("p1_test.npy"))
-    if len(p1) != len(keys):
-        raise ValueError(f"p1_test has {len(p1)} rows for {len(keys)} test pairs: rerun stage1")
-    kept = p1 >= res["prune_tau"]                 # the tau stage 2 was trained with
-    kk = keys[kept].reset_index(drop=True)
-    X = stage2_matrix("test", keys, p1, kept)
-    p2 = predict_cross(load_models("stage2"), X, None)
-    del X
-    keep = apply_rule(kk, p2, res["rules"])
-    np.save(run_path("p2_test.npy"), p2)
-    np.save(run_path("kept_test.npy"), kept)
-    np.save(run_path("keep_test.npy"), keep)
+def write_outputs(kk: pd.DataFrame, keep: np.ndarray, log_tag: str) -> tuple[str, str, int, int]:
+    """Stream output/matching_results.tsv and output/candidate_pairs.tsv (candidates = ``kk``)."""
     out_dir = REPO_ROOT / "output"
     out_dir.mkdir(exist_ok=True)
     mpath, cpath = out_dir / "matching_results.tsv", out_dir / "candidate_pairs.tsv"
@@ -509,16 +698,52 @@ def predict(name: str) -> None:
             n_s1 += st.n(1)
             n_m += a
             n_c += b
-    log.info(f"[predict] {n_s1:,} S1: {n_c:,} candidates ({n_c / n_s1:.2f}/S1), {n_m:,} matches "
+    log.info(f"[{log_tag}] {n_s1:,} S1: {n_c:,} candidates ({n_c / n_s1:.2f}/S1), {n_m:,} matches "
              f"({n_m / n_s1:.2f}/S1) {mem_str()}")
-    finalize_submission(name, str(mpath), str(cpath), offline_metrics=res["report"],
+    return str(mpath), str(cpath), n_m, n_c
+
+
+def test_p2(res: dict, tag: str, keys: pd.DataFrame, p1: np.ndarray, kept: np.ndarray) -> np.ndarray:
+    """Stage-2 p of the pruned test pairs: mean of the fold models of each member, then the ensemble rule."""
+    X = stage2_matrix("test", keys, p1, kept, res.get("base_features", FEATURES_V5),
+                      load_ce("test", len(keys)) if res.get("use_ce", False) else None)
+    ens = res.get("ensemble", {"members": ["lgb"], "chosen": "lgb"})
+    members = {}
+    for m in ens["members"]:
+        models = load_models("stage2" + sfx(tag)) if m == "lgb" else load_xgb_models("stage2" + sfx(tag))
+        members[m] = predict_cross(models, X, None)
+    return combine_members(members, ens["chosen"])
+
+
+def predict(name: str, tag: str = "") -> None:
+    """Test: prune by p1, stage-2 p2 (ensemble of fold models), decision, write + validate."""
+    from .submit import finalize_submission
+
+    res = json.load(open(run_path(f"stage2{sfx(tag)}.json")))
+    keys, _ = read_keys("test")
+    p1 = np.load(run_path("p1_test.npy"))
+    if len(p1) != len(keys):
+        raise ValueError(f"p1_test has {len(p1)} rows for {len(keys)} test pairs: rerun stage1")
+    kept = p1 >= res["prune_tau"]                 # the tau stage 2 was trained with
+    kk = keys[kept].reset_index(drop=True)
+    p2 = test_p2(res, tag, keys, p1, kept)
+    keep = apply_rule(kk, p2, res["rules"])
+    np.save(run_path(f"p2_test{sfx(tag)}.npy"), p2)
+    np.save(run_path(f"kept_test{sfx(tag)}.npy"), kept)
+    np.save(run_path(f"keep_test{sfx(tag)}.npy"), keep)
+    mpath, cpath, n_m, n_c = write_outputs(kk, keep, f"predict{sfx(tag)}")
+    ens = res.get("ensemble", {}).get("chosen", "lgb")
+    finalize_submission(name, mpath, cpath, offline_metrics=res["report"],
                         n_match_pairs=n_m, n_candidate_pairs=n_c,
-                        notes="v5: TF-IDF + fine-tuned e5 union, stage1 GBDT, prune, stage2 GBDT")
+                        notes=f"v5: TF-IDF + fine-tuned e5 union, stage1 GBDT, prune, stage2 ({ens})"
+                              + (" + cross-encoder feature" if res.get("use_ce") else " (no cross-encoder)"))
 
 
 # ------------------------------------------------------------------ compare
 def compare(baseline_run: str | None = None) -> None:
-    """Paired bootstrap on fold-0 entities: v5 stage 1 / stage 2 vs the baseline run."""
+    """Paired bootstrap on fold-0 entities: every v5 stage vs the baseline, and the CE ablation."""
+    import glob
+
     baseline_run = baseline_run or vdir("tfidf")
     boot = load_config()["bootstrap"]
     base_dir = artifact_path(baseline_run)
@@ -531,16 +756,28 @@ def compare(baseline_run: str | None = None) -> None:
     bkeep = Decider(bkeys, np.load(os.path.join(base_dir, "oof.npy"))).keep(bd["t_first"], bd["t_rest"], bd["arbitrate"])
     rep = vcfg()["report_fold"]
     f_base = EntityScorer(bents, bkeys, (bents["fold"] == rep).to_numpy()).per_entity(bkeep)
+    per = {os.path.basename(pth)[len("per_entity_"):-4]: np.load(pth)
+           for pth in sorted(glob.glob(run_path("per_entity_*.npy")))}
     out = {}
-    for tag in ("stage1", "stage2"):
-        path = run_path(f"per_entity_{tag}.npy")
-        if not os.path.exists(path):
-            continue
-        f = np.load(path)
+
+    def verdict(bs):
+        if bs["ci_low"] > 0 and bs["delta"] >= boot["materiality"]:
+            return "KEEP (CI > 0 and delta >= materiality)"
+        return "WORSE (CI < 0)" if bs["ci_high"] < 0 else "NO CLEAR DIFFERENCE"
+
+    for tag, f in per.items():
         bs = paired_bootstrap(f_base, f, boot["n_resamples"], boot["alpha"])
-        out[tag] = bs
+        bs["verdict"] = verdict(bs)
+        out[f"{tag}_vs_baseline"] = bs
         log.info(f"[compare] {tag} vs {baseline_run}: {f.mean():.5f} vs {f_base.mean():.5f}  "
-                 f"delta {bs['delta']:+.5f}  CI [{bs['ci_low']:+.5f}, {bs['ci_high']:+.5f}]")
+                 f"delta {bs['delta']:+.5f}  CI [{bs['ci_low']:+.5f}, {bs['ci_high']:+.5f}]  {bs['verdict']}")
+    if "stage2" in per and "stage2_noce" in per:           # the cross-encoder's own contribution
+        bs = paired_bootstrap(per["stage2_noce"], per["stage2"], boot["n_resamples"], boot["alpha"])
+        bs["verdict"] = verdict(bs)
+        out["ce_ablation_stage2_vs_stage2_noce"] = bs
+        log.info(f"[compare] cross-encoder ablation: stage2 {per['stage2'].mean():.5f} vs stage2_noce "
+                 f"{per['stage2_noce'].mean():.5f}  delta {bs['delta']:+.5f}  "
+                 f"CI [{bs['ci_low']:+.5f}, {bs['ci_high']:+.5f}]  {bs['verdict']}")
     json.dump(out, open(run_path("compare.json"), "w"), indent=2)
 
 
@@ -548,9 +785,12 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("stage1")
-    sub.add_parser("stage2")
+    s2 = sub.add_parser("stage2")
+    s2.add_argument("--tag", default="", help="variant name: outputs get a _<tag> suffix")
+    s2.add_argument("--no-ce", action="store_true", help="without the cross-encoder features")
     p = sub.add_parser("predict")
     p.add_argument("--name", required=True)
+    p.add_argument("--tag", default="", help="which stage-2 variant to use")
     c = sub.add_parser("compare")
     c.add_argument("--baseline", default=None, help="baseline run folder (default: v5.tfidf_run)")
     args = ap.parse_args()
@@ -558,9 +798,9 @@ def main() -> None:
     if args.cmd == "stage1":
         stage1()
     elif args.cmd == "stage2":
-        stage2()
+        stage2(args.tag, False if args.no_ce else None)
     elif args.cmd == "predict":
-        predict(args.name)
+        predict(args.name, args.tag)
     else:
         compare(args.baseline)
 

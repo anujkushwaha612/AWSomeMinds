@@ -30,8 +30,8 @@ from .store import split_countries
 from .neural.common import country_store
 
 
-def load_run(run: str):
-    """(keys, ents, p, decision-mask function) for the train universe of ``run``."""
+def load_run(run: str, tag: str = ""):
+    """(keys, ents, p, decision-mask function) for the train universe of ``run`` (v5: stage-2 variant ``tag``)."""
     if run == "baseline":
         from . import baseline as B
         name = load_config()["v5"]["tfidf_run"]              # the TF-IDF baseline run folder
@@ -42,18 +42,18 @@ def load_run(run: str):
         return keys, ents, p, lambda k, pp: Decider(k, pp).keep(d["t_first"], d["t_rest"], d["arbitrate"])
     from . import v5 as V
     keys, ents = V.read_keys("train")
-    kept = np.load(V.run_path("kept_train.npy"))
+    kept = np.load(V.run_path(f"kept_train{V.sfx(tag)}.npy"))
     keys = keys[kept].reset_index(drop=True)
-    p = np.load(V.run_path("p2_train.npy"))
-    rules = json.load(open(V.run_path("stage2.json")))["rules"]
+    p = np.load(V.run_path(f"p2_train{V.sfx(tag)}.npy"))
+    rules = json.load(open(V.run_path(f"stage2{V.sfx(tag)}.json")))["rules"]
     return keys, ents, p, lambda k, pp: V.apply_rule(k, pp, rules)
 
 
-def stress(run: str, seeds: int = 3) -> dict:
+def stress(run: str, seeds: int = 3, tag: str = "") -> dict:
     """Fold-0 macro F0.5 with and without the density stress (same rule; re-tuned T)."""
     cfg = load_config()["v5"]
     frac, rep = cfg["stress_fraction"], cfg["report_fold"]
-    keys, ents, p, decide = load_run(run)
+    keys, ents, p, decide = load_run(run, tag)
     rep_mask = (ents["fold"] == rep).to_numpy()
     tune_folds = [f for f in (cfg["gbdt_folds"] if run == "v5" else range(load_config()["validation"]["n_folds"]))
                   if f != rep]
@@ -85,26 +85,27 @@ def stress(run: str, seeds: int = 3) -> dict:
            "stressed_retuned_mean": float(np.mean([r["f05_retuned"] for r in res])), "seeds": res}
     print(f"[stress {run}] unstressed {base:.5f} -> stressed {out['stressed_same_rule_mean']:.5f} "
           f"(same rule), {out['stressed_retuned_mean']:.5f} (re-tuned)", flush=True)
-    json.dump(out, open(artifact_path("experiments", f"C1_stress_{run}.json"), "w"), indent=2)
+    suffix = f"_{tag}" if tag else ""
+    json.dump(out, open(artifact_path("experiments", f"C1_stress_{run}{suffix}.json"), "w"), indent=2)
     return out
 
 
-def france() -> dict:
-    """Per-country test prediction statistics next to train fold 0 (v5 run)."""
+def france(tag: str = "") -> dict:
+    """Per-country test prediction statistics next to train fold 0 (v5 run, stage-2 variant ``tag``)."""
     from . import v5 as V
     rep = load_config()["v5"]["report_fold"]
     out = {}
     for split in ("train", "test"):
         keys, ents = V.read_keys(split)
-        kept = np.load(V.run_path(f"kept_{split}.npy"))
+        kept = np.load(V.run_path(f"kept_{split}{V.sfx(tag)}.npy"))
         keys = keys[kept].reset_index(drop=True)
-        p = np.load(V.run_path(f"p2_{split}.npy"))
+        p = np.load(V.run_path(f"p2_{split}{V.sfx(tag)}.npy"))
         if split == "train":
-            rules = json.load(open(V.run_path("stage2.json")))["rules"]
+            rules = json.load(open(V.run_path(f"stage2{V.sfx(tag)}.json")))["rules"]
             keep = V.apply_rule(keys, p, rules)
             sel_e = (ents["fold"] == rep).to_numpy()
         else:
-            keep = np.load(V.run_path("keep_test.npy"))
+            keep = np.load(V.run_path(f"keep_test{V.sfx(tag)}.npy"))
             sel_e = np.ones(len(ents), dtype=bool)
         rec = (keys["country"].to_numpy(np.int64) << 40) | (keys["src"].to_numpy(np.int64) << 32) \
             | keys["doc_row"].to_numpy(np.int64)
@@ -163,16 +164,18 @@ def main() -> None:
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("stress")
     s.add_argument("--run", default="v5", choices=["v5", "baseline"])
-    sub.add_parser("france")
+    s.add_argument("--tag", default="", help="v5 stage-2 variant")
+    fr = sub.add_parser("france")
+    fr.add_argument("--tag", default="", help="v5 stage-2 variant")
     pr = sub.add_parser("probe")
     pr.add_argument("--name", default="probe_country_empty")
     pr.add_argument("--country", default="France", help="test country whose rows are emptied")
     args = ap.parse_args()
     os.makedirs(artifact_path("experiments"), exist_ok=True)
     if args.cmd == "stress":
-        stress(args.run)
+        stress(args.run, tag=args.tag)
     elif args.cmd == "france":
-        france()
+        france(args.tag)
     else:
         probe(args.name, args.country)
 
