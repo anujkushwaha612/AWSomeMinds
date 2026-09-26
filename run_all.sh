@@ -58,9 +58,16 @@ stage dense_test           -u -m ber.neural.dense_retrieve --split test
 stage union_train          -u -m ber.union --split train
 stage union_test           -u -m ber.union --split test
 stage stage1               -u -m ber.v5 stage1
+stage stage2_noce          -u -m ber.v5 stage2 --tag noce --no-ce       # safe submission + CE ablation reference
+stage predict_noce         -u -m ber.v5 predict --tag noce --name sub_v5_noce
+stage ce_pairs             -u -m ber.neural.cross_encoder pairs
+stage ce_train             -u -m ber.neural.cross_encoder train "${CPU_ARGS[@]}"
+stage ce_score_train       -u -m ber.neural.cross_encoder score --split train "${CPU_ARGS[@]}"
+stage ce_score_test        -u -m ber.neural.cross_encoder score --split test "${CPU_ARGS[@]}"
 stage stage2               -u -m ber.v5 stage2
 stage compare              -u -m ber.v5 compare
 stage stress               -u -m ber.gap stress --run v5
 stage predict              -u -m ber.v5 predict --name sub_v5
 stage france               -u -m ber.gap france
-say "\nDONE. Upload output/matching_results.tsv (snapshot: subs/sub_v5)."
+say "\nDONE. Snapshots: subs/sub_v5_noce (no cross-encoder) and subs/sub_v5 (with; now in output/)."
+say "Pick by artifacts/v5/compare.json -> ce_ablation_stage2_vs_stage2_noce (upload sub_v5 only if its CI > 0)."

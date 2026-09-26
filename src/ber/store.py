@@ -80,7 +80,9 @@ class CountryStore:
         """Retrieval view text (name + " " + address) for rows [start, stop)."""
         name = self.column(s, "name_n").slice(start, stop - start)
         addr = self.column(s, "addr_n").slice(start, stop - start)
-        return pc.binary_join_element_wise(name, addr, " ").to_pylist()
+        # separator typed like the columns: newer pandas writes large_string, and Arrow
+        # has no kernel for (large_string, large_string, string)
+        return pc.binary_join_element_wise(name, addr, pa.scalar(" ", type=name.type)).to_pylist()
 
     def numpy(self, s: int, name: str) -> np.ndarray:
         """A numeric (or id) column as a NumPy array."""

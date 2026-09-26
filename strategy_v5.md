@@ -192,3 +192,46 @@ macro F0.5; the measured quantity bounds how much it can matter. None of these a
 | `ber/union.py` | A5 | union candidates + features |
 | `ber/stage2.py` | B2–B4 | stage-2 features / model / pruning / decision, submission |
 | `ber/gap.py` | C1–C3 | density stress, France diagnostics, France-empty probe file |
+
+---
+
+## 9. v5.1 — review of the external upgrade list (2026-09-26)
+
+Each proposal was checked against our measurements (phase0_report.md, experiments.md E2/E4) and against
+what the code already does, before anything was built. Tags as above.
+
+| Proposal | Verdict | Reason |
+|---|---|---|
+| Mask false negatives in the bi-encoder's in-batch softmax | **already in** (`false_negative_mask`) + **refined** | Added `duplicate_text_mask`: S1 is deduplicated by entity, not by text, so an S1 whose name + address is identical to the parent's is also masked (indistinguishable → contradictory gradient) |
+| "Target LLC" vs "Target Corp" must not be pushed apart | **reject** | Two distinct S1 rows are two distinct entities (S1 is the deduplicated reference); separating them is the task |
+| Density-stressed thresholds may overfit | **agree; unchanged** | `ber.gap stress` stays a diagnostic; submitted thresholds are never tuned under stress automatically |
+| Digit / structural mismatch features | **built** (`STRUCT_FEATURES`) | `house_state` compares only the first number and `digit_jacc` is diluted by shared PIN/ZIP. New set-level features: numbers only in S1 / only in the record, **conflict** = both sides have an unmatched number (a missing component is one-sided, not a conflict), conflict length (1-digit unit vs 6-digit PIN), same for digits in names. Generic (no country or format rules) |
+| Top-1 − top-2 margin as a stage-2 feature | **already in** | `p_minus_rec_other`, `rec_p2`, `p_minus_s1src_other` |
+| Linear sum assignment / bipartite matching | **reject** | An S1 has up to 5 S2 + 6 S3 true matches, so 1-to-1 assignment would delete true pairs. The only exact constraint is *record → at most one S1* (phase0 §2); under that constraint alone the per-record argmax (our hard arbitration) is already the global optimum of any per-pair objective. The S1-side caps (≤5/≤6) are almost never reached by predictions |
+| Address parsing (usaddress / deepparse), geohash | **reject** | usaddress is US-only, deepparse is LGPL (the model rule is MIT/Apache); there are no coordinates, and inferring them from ZIP/PIN needs external data (prohibited). The number-conflict features capture the parsed-component signal that matters (unit, house number, postcode) |
+| Connected components for GT expansion | **reject** | GT is already a complete star clustering (each record exactly one parent): no transitive pairs to add |
+| Cross-encoder on uncertain pairs | **built** (`ber.neural.cross_encoder`) | Strongest remaining lever: "found but rejected" (0.021) + FP (0.015, 72% orphan look-alikes). The proposed band 0.45–0.65 is far too narrow (5% of true pairs have p < 0.556; E4); default band = p1 ∈ [prune_tau, 0.995], configurable |
+| Projection "0.976–0.983" | **not used** | No measurement supports it; the fold-0 paired bootstrap decides |
+
+### 9.1 D: cross-encoder (as built)
+
+- **Where:** after stage 1; its logit `ce` and the margin to the record's best other scored S1
+  (`ce_minus_rec_other`) are stage-2 features (NaN outside the band; LightGBM routes missing values).
+- **Leakage:** training pairs need the S1 in folds 3–4 **and** the record owned by folds 3–4 (its parent's
+  fold; orphans get a deterministic hash fold). Same domain as the bi-encoder, so fold 0 and test are both
+  unseen. Residual (documented): an orphan owned by folds 3–4 can also be a negative candidate of a fold
+  0–2 S1; and, as for the bi-encoder cosine, fold 3–4 pairs get in-sample `ce` values when they compete in
+  arbitration with fold-0 entities.
+- **Model:** `AutoModelForSequenceClassification` (1 logit) initialised from the fine-tuned e5 (XLM-R,
+  278M, MIT), input `S1 name | addr </s></s> record name | addr`, max_len 128, BCE, 1 epoch on ≤ 2M pairs.
+- **Validation built into the run:** `stage2 --tag noce --no-ce` is trained first on the same pruned
+  pairs and submitted as `sub_v5_noce` (safe submission). `compare` then reports the paired bootstrap
+  `stage2` vs `stage2_noce` on fold 0 (`ce_ablation_stage2_vs_stage2_noce`). **Upload `sub_v5` only if
+  that CI is > 0.** Stage-1 and stage-2 logs print the gain share of every feature (evidence for the
+  number-conflict features).
+
+### 9.2 Hardware (32 GB VRAM)
+
+US train embeddings are 7.5M × 768 fp16 ≈ 11.5 GB; `tile_gb` lowered to 4 (similarity tile) so dense
+search stays under ~18 GB. Bi-encoder (batch 256, len 64) and cross-encoder (batch 128, len 128) training
+fit comfortably. If CUDA runs out of memory, see GPU_RUNBOOK.md §5.

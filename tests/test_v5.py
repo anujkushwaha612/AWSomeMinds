@@ -114,3 +114,45 @@ def test_entity_uniform_is_per_entity_and_deterministic():
     u = entity_uniform(k, 7)
     assert u[0] == u[1] and 0 <= u.min() and u.max() < 1
     assert np.array_equal(u, entity_uniform(k, 7)) and not np.array_equal(u, entity_uniform(k, 8))
+
+
+def test_number_features_conflict_vs_missing():
+    from ber.features import _number_features
+    a_d = ["12 400 411001", "12 411001", "", "7"]
+    b_d = ["12 500 411001", "12", "", "7"]
+    a_n = ["studio 54", "alpha", "7 eleven", "x"]
+    b_n = ["studio 55", "alpha", "eleven", "x"]
+    f = _number_features(a_d, b_d, a_n, b_n)
+    assert f["num_conflict"].tolist() == [1, 0, 0, 0]        # suite 400 vs 500 is a conflict
+    assert f["num_conflict_len"].tolist() == [3, 0, 0, 0]
+    assert f["num_only_s1"].tolist() == [1, 1, 0, 0]         # a missing PIN is one-sided, not a conflict
+    assert f["num_only_rec"].tolist() == [1, 0, 0, 0]
+    assert f["name_num_conflict"].tolist() == [1, 0, 0, 0]
+    assert f["name_num_diff"].tolist() == [2, 0, 1, 0]
+
+
+def test_duplicate_text_mask():
+    from ber.neural.train_biencoder import duplicate_text_mask
+    pos = ["a | x", "b | y"]
+    neg = ["a | x", "c | z"]                                 # row 0's hard negative has its parent's text
+    m = duplicate_text_mask(pos, neg)
+    assert m.shape == (2, 4)
+    assert m[0, 2] and not m[0, 0] and not m[1].any()
+
+
+def test_ce_features_margin_and_nan():
+    from ber.v5 import ce_features
+    keys = pd.DataFrame({"country": [0, 0, 0, 0], "src": [2, 2, 2, 3], "doc_row": [0, 0, 1, 0],
+                         "s1_row": [0, 1, 1, 1]})
+    ce = np.array([2.0, -1.0, 3.0, np.nan])
+    f = ce_features(keys, ce)
+    np.testing.assert_allclose(f["ce_minus_rec_other"].to_numpy()[:2], [3.0, -3.0])
+    assert np.isnan(f["ce_minus_rec_other"].iloc[2])          # only scored candidate of its record
+    assert np.isnan(f["ce"].iloc[3]) and np.isnan(f["ce_minus_rec_other"].iloc[3])
+
+
+def test_ce_band_never_below_prune_tau():
+    from ber.neural.cross_encoder import band
+    from ber.config import load_config
+    lo, hi = band()
+    assert lo >= load_config()["v5"]["prune_tau"] and hi <= 1.0

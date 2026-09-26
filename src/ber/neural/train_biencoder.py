@@ -1,7 +1,9 @@
 """A2-A3: fine-tune the multilingual bi-encoder, then run the recall gate (GPU).
 
 Loss: in-batch softmax (MultipleNegativesRanking) over [positives; hard negatives]
-for each record query, scale ``v5.neural.scale``. Batches are drawn from one country
+for each record query, scale ``v5.neural.scale``. Columns that are in fact the row's
+parent (another record of the same entity, or a hard negative that is another row's
+parent) and S1s with text identical to the parent's are masked out of the softmax. Batches are drawn from one country
 at a time (``same_country_batches``): cross-country negatives are trivially easy.
 Mixed precision (bf16 where supported), AdamW, linear warmup/decay, grad clip 1.0.
 Checkpoints every 2,000 steps to artifacts/neural/biencoder (resumable).
@@ -79,6 +81,20 @@ def false_negative_mask(pairs: pd.DataFrame, idx: np.ndarray) -> np.ndarray:
     return mask
 
 
+def duplicate_text_mask(pos_texts: list[str], neg_texts: list[str]) -> np.ndarray:
+    """[B, 2B] True where column j's S1 text is identical to row i's positive text.
+
+    S1 is deduplicated by entity, not by text: two S1 entities can share name and address
+    exactly. Such a column cannot be told apart from the target, so it only adds a
+    contradictory gradient; it is masked like a false negative. The row's own positive
+    stays the target.
+    """
+    h = pd.util.hash_array(np.asarray(pos_texts + neg_texts, dtype=object))
+    mask = h[:len(pos_texts), None] == h[None, :]
+    np.fill_diagonal(mask[:, :len(pos_texts)], False)
+    return mask
+
+
 def run_fingerprint(pairs: pd.DataFrame, c: dict) -> str:
     """Identifies a training run; a checkpoint is resumed only if this matches."""
     import hashlib
@@ -137,7 +153,7 @@ def train(max_steps: int | None = None) -> None:
         """CPU work for one step, run on a helper thread while the GPU trains."""
         idx = batches[step]
         q, p, n = texts_for_batch(stores, pairs, idx)
-        return enc.tokenize(q), enc.tokenize(p + n), false_negative_mask(pairs, idx)
+        return enc.tokenize(q), enc.tokenize(p + n), false_negative_mask(pairs, idx) | duplicate_text_mask(p, n)
 
     with ThreadPoolExecutor(max_workers=1) as ex:
         nxt = ex.submit(prepare, start) if start < total else None

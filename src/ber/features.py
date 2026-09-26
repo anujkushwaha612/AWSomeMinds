@@ -15,6 +15,8 @@ string features run chunk by chunk (text looked up from the Arrow store for
 that chunk only) and every chunk is appended to a parquet file.
 """
 
+import re
+
 import numpy as np
 import pandas as pd
 import pyarrow as pa
@@ -30,6 +32,13 @@ FEATURES = [
     "src", "rec_indic", "rec_addr_empty", "name_len_ratio", "addr_len_ratio",
 ]
 KEY_COLS = ["src", "doc_row", "s1_row"]
+# Number-conflict features (v5 union only; the baseline feature files do not have them).
+# house_state compares only the FIRST number; these compare the full number sets, so
+# "suite 400" vs "suite 500" or a differing PIN/ZIP registers as a conflict even when
+# the house number and every string similarity agree.
+STRUCT_FEATURES = ["num_only_s1", "num_only_rec", "num_conflict", "num_conflict_len",
+                   "name_num_conflict", "name_num_diff"]
+DIGIT_RUN = re.compile(r"\d+")
 
 
 def _sim(a, b, scorer) -> np.ndarray:
@@ -54,6 +63,44 @@ def _digit_features(a: list[str], b: list[str]):
     return jacc, house, na, nb
 
 
+def _number_features(a_digits: list[str], b_digits: list[str],
+                     a_name: list[str], b_name: list[str]) -> dict:
+    """Set-level number agreement between S1 (a) and record (b).
+
+    Address numbers (``addr_digits`` tokens): how many are only in S1 / only in the
+    record; a *conflict* is when both sides have an unmatched number (a missing
+    component only makes one side non-empty, which is benign), and its length is the
+    shorter of the two sides' longest unmatched number (1-digit unit vs 6-digit PIN).
+    Name numbers (digit runs in ``name_n``): the same conflict count, plus the total
+    number of unmatched name numbers.
+    """
+    n = len(a_digits)
+    only_a = np.zeros(n, dtype=np.int16)
+    only_b = np.zeros(n, dtype=np.int16)
+    conflict = np.zeros(n, dtype=np.int16)
+    conflict_len = np.zeros(n, dtype=np.int16)
+    name_conflict = np.zeros(n, dtype=np.int16)
+    name_diff = np.zeros(n, dtype=np.int16)
+    for i in range(n):
+        x, y = a_digits[i], b_digits[i]
+        if x or y:
+            sx, sy = set(x.split()), set(y.split())
+            ox, oy = sx - sy, sy - sx
+            only_a[i], only_b[i] = len(ox), len(oy)
+            if ox and oy:
+                conflict[i] = min(len(ox), len(oy))
+                conflict_len[i] = min(max(map(len, ox)), max(map(len, oy)))
+        nx, ny = DIGIT_RUN.findall(a_name[i]), DIGIT_RUN.findall(b_name[i])
+        if nx or ny:
+            sx, sy = set(nx), set(ny)
+            ox, oy = len(sx - sy), len(sy - sx)
+            name_conflict[i] = min(ox, oy)
+            name_diff[i] = ox + oy
+    return {"num_only_s1": only_a, "num_only_rec": only_b, "num_conflict": conflict,
+            "num_conflict_len": conflict_len, "name_num_conflict": name_conflict,
+            "name_num_diff": name_diff}
+
+
 def _len_ratio(a: list[str], b: list[str]) -> np.ndarray:
     la = np.fromiter((len(x) for x in a), dtype=np.int32, count=len(a))
     lb = np.fromiter((len(x) for x in b), dtype=np.int32, count=len(b))
@@ -73,8 +120,12 @@ def retrieval_features(cand: pd.DataFrame) -> pd.DataFrame:
     return cand
 
 
-def string_block(store, src: int, s1_rows: np.ndarray, doc_rows: np.ndarray) -> dict:
-    """String/structure features for aligned (S1 row, doc row) arrays of one source."""
+def string_block(store, src: int, s1_rows: np.ndarray, doc_rows: np.ndarray,
+                 extra: bool = False) -> dict:
+    """String/structure features for aligned (S1 row, doc row) arrays of one source.
+
+    ``extra`` adds :data:`STRUCT_FEATURES` (used by the v5 union files only).
+    """
     def pair(col):
         return store.strings(1, col, s1_rows), store.strings(src, col, doc_rows)
 
@@ -85,6 +136,10 @@ def string_block(store, src: int, s1_rows: np.ndarray, doc_rows: np.ndarray) -> 
     out["name_partial"] = _sim(an, bn, fuzz.partial_ratio)
     out["name_jw"] = _sim(an, bn, JaroWinkler.normalized_similarity)
     out["name_len_ratio"] = _len_ratio(an, bn)
+    if extra:
+        ad, bd = pair("addr_digits")
+        out.update(_number_features(ad, bd, an, bn))
+        del ad, bd
     del an, bn
     a, b = pair("name_legal")
     out["legal_ratio"] = _sim(a, b, fuzz.ratio)
@@ -109,11 +164,12 @@ def string_block(store, src: int, s1_rows: np.ndarray, doc_rows: np.ndarray) -> 
 
 
 def write_features(cand: pd.DataFrame, store, path: str, chunk: int = 500_000,
-                   log=print) -> int:
+                   log=print, extra: bool = False) -> int:
     """Compute string features chunk by chunk and append everything to ``path``.
 
     ``cand`` holds keys, retrieval features and (on train) ``label``. Returns the
-    number of rows written. Row order in the file = row order of ``cand``.
+    number of rows written. Row order in the file = row order of ``cand`` (which must
+    be sorted by ``src`` within each chunk). ``extra``: see :func:`string_block`.
     """
     writer = None
     n = len(cand)
@@ -125,7 +181,7 @@ def write_features(cand: pd.DataFrame, store, path: str, chunk: int = 500_000,
             if not m.any():
                 continue
             sub = part[m].reset_index(drop=True)
-            feats = string_block(store, src, sub["s1_row"].to_numpy(), sub["doc_row"].to_numpy())
+            feats = string_block(store, src, sub["s1_row"].to_numpy(), sub["doc_row"].to_numpy(), extra)
             blocks.append(pd.concat([sub, pd.DataFrame(feats)], axis=1))
         table = pa.Table.from_pandas(pd.concat(blocks, ignore_index=True), preserve_index=False)
         if writer is None:

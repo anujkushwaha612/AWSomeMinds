@@ -72,13 +72,33 @@ v5:
     encode_batch: 512
     k_rec: 3                  # E4: TF-IDF finds 97-98% of found parents at rank 0; ranks 1-2 add 2-3 pp
     k_s1: 5                   # E4: S1-side list per source; per-source true matches <= 5 for 100% (S2) / 99.9% (S3)
-    tile_gb: 6.0              # similarity tile size on the GPU
+    tile_gb: 4.0              # similarity tile size on the GPU (32 GB card: US train embeddings ~11.5 GB + tile)
     gate_k: 5                 # recall gate: report R@1 / R@3 / R@gate_k
     weight_decay: 0.01        # [L]
     grad_clip: 1.0            # [L]
     log_every: 100            # training log interval (steps)
     checkpoint_every: 2000    # resumable checkpoint interval (steps)
     train_budget_h: 3.0       # env_check suggests fewer pairs if training would exceed this
+  cross_encoder:
+    # D (ber.neural.cross_encoder): re-scores the stage-1 gray zone; its logit is a stage-2 feature.
+    # E2/E4: 'found but rejected' (0.021) + false positives (0.015, 72% orphan look-alikes) are the
+    # largest losses; token-level cross-attention targets exactly those. Ablated in compare
+    # (stage2 vs stage2_noce, paired bootstrap): drop it if the CI is not > 0.
+    enabled: true
+    init: biencoder           # start from the fine-tuned e5 weights (MIT); or a hub model name
+    band: [null, 0.995]       # p1 range scored; null = v5.prune_tau (pruned pairs never reach stage 2)
+    max_len: 128              # two texts of p99 <= 56 tokens each (E4)
+    batch_size: 128           # [L]
+    lr: 2.0e-5                # [L]
+    warmup: 0.05
+    epochs: 1
+    weight_decay: 0.01
+    grad_clip: 1.0
+    max_train_pairs: 2000000  # sampled from encoder-fold band pairs (natural label ratio)
+    score_batch: 1024         # inference batch (no gradients)
+    score_chunk: 500000       # pairs whose texts are materialized at once (CPU RAM)
+    log_every: 100
+    checkpoint_every: 2000
   drop_encoder_records: false # true = remove encoder-seen records from the train GBDT universe (leakage check fallback)
   early_stop_share: 0.1       # share of training ENTITIES held out for LightGBM early stopping
   prune_tau: 0.003            # E4: 14.0 -> 5.05 candidates/S1 at oracle loss 0.00004

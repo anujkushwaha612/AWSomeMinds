@@ -115,6 +115,15 @@ Stage "dense_test"       @("-u", "-m", "ber.neural.dense_retrieve", "--split", "
 Stage "union_train"      @("-u", "-m", "ber.union", "--split", "train")
 Stage "union_test"       @("-u", "-m", "ber.union", "--split", "test")
 Stage "stage1"           @("-u", "-m", "ber.v5", "stage1")
+# safe submission first (no cross-encoder); also the ablation reference for the CE
+Stage "stage2_noce"      @("-u", "-m", "ber.v5", "stage2", "--tag", "noce", "--no-ce")
+Stage "predict_noce"     @("-u", "-m", "ber.v5", "predict", "--tag", "noce", "--name", "sub_v5_noce")
+
+# ------------------------------------------------------------------ D: cross-encoder on the gray zone (GPU)
+Stage "ce_pairs"         @("-u", "-m", "ber.neural.cross_encoder", "pairs")
+Stage "ce_train"         (@("-u", "-m", "ber.neural.cross_encoder", "train") + $cpuArgs)
+Stage "ce_score_train"   (@("-u", "-m", "ber.neural.cross_encoder", "score", "--split", "train") + $cpuArgs)
+Stage "ce_score_test"    (@("-u", "-m", "ber.neural.cross_encoder", "score", "--split", "test") + $cpuArgs)
 Stage "stage2"           @("-u", "-m", "ber.v5", "stage2")
 Stage "compare"          @("-u", "-m", "ber.v5", "compare")
 
@@ -123,5 +132,6 @@ Stage "stress"           @("-u", "-m", "ber.gap", "stress", "--run", "v5")
 Stage "predict"          @("-u", "-m", "ber.v5", "predict", "--name", "sub_v5")
 Stage "france"           @("-u", "-m", "ber.gap", "france")
 
-Say "`nDONE. Upload output\matching_results.tsv (snapshot: subs\sub_v5)." "Green"
+Say "`nDONE. Two snapshots: subs\sub_v5_noce (no cross-encoder) and subs\sub_v5 (with; now in output\)." "Green"
+Say "Pick by artifacts\v5\compare.json -> ce_ablation_stage2_vs_stage2_noce (upload sub_v5 only if its CI is > 0)." "Green"
 Say "Offline results: artifacts\v5\stage2.json, artifacts\v5\compare.json, artifacts\neural\eval.json, artifacts\experiments\C*.json" "Green"
