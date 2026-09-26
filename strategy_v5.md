@@ -27,7 +27,7 @@ its gate by the evening of 26 Sep.
 
 ## 1. Where each step runs
 
-**Everything runs on the GPU machine** (friend: 48 GB VRAM, ~15.7 GB RAM): `run_v5.ps1` executes
+**Everything runs on the GPU machine** (friend: 48 GB VRAM, ~15.7 GB RAM): `run_all.ps1` executes
 A → B → C end to end; setup and inputs are in [GPU_RUNBOOK.md](GPU_RUNBOOK.md). The laptop has no
 NVIDIA GPU (and Smart App Control blocks PyTorch there); it only prepared the code and the baseline
 artifacts (`artifacts/`, ~7.5 GB: copy them over, or rebuild with `run_baseline.ps1`, ~2.5 h).
@@ -122,7 +122,7 @@ with mean |C| per S1 reported; if |C| grows much, prune in B3.
 
 ## 6. Order of work and submissions
 
-All on the GPU machine, in `run_v5.ps1` order. Times depend on the A0 probe; fill them in after it runs.
+All on the GPU machine, in `run_all.ps1` order. Times depend on the A0 probe; fill them in after it runs.
 
 | Step | Stage | Submission |
 |---|---|---|

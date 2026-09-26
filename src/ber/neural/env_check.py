@@ -20,8 +20,27 @@ N_ENC = 20_000
 N_STEPS = 30
 
 
+def data_sizes() -> tuple[int, int]:
+    """(training pairs, texts to encode) measured from the artifacts, not assumed."""
+    import os
+    import pyarrow.parquet as pq
+    from ..config import artifact_path
+    from ..store import norm_path
+    from .common import vdir
+    pairs_path = artifact_path(vdir("neural"), "train_pairs.parquet")
+    n_pairs = pq.ParquetFile(pairs_path).metadata.num_rows if os.path.exists(pairs_path) else 0
+    n_texts = sum(pq.ParquetFile(norm_path(split, s)).metadata.num_rows
+                  for split in ("train", "test") for s in (1, 2, 3))
+    return n_pairs, n_texts
+
+
 def main() -> None:
+    import argparse
     import torch
+
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--allow-cpu", action="store_true", help="smoke tests without a GPU")
+    allow_cpu = ap.parse_args().allow_cpu
 
     print(f"torch {torch.__version__}  cuda available {torch.cuda.is_available()}")
     if torch.cuda.is_available():
@@ -29,7 +48,9 @@ def main() -> None:
         print(f"GPU {p.name}  VRAM {p.total_memory / 2**30:.1f} GB  bf16 {torch.cuda.is_bf16_supported()}"
               f"  CUDA {torch.version.cuda}")
     else:
-        print("WARNING: no CUDA GPU visible -- the GPU stages would run on CPU (far too slow).")
+        print("ERROR: no CUDA GPU visible -- the GPU stages would run on CPU (far too slow).")
+        if not allow_cpu:
+            raise SystemExit(1)
     c = ncfg()
     country = split_countries("train")[0]
     store = country_store("train", country, cols=["name_n", "addr_n"])
@@ -75,20 +96,28 @@ def main() -> None:
     step_rate = N_STEPS / (time.time() - t)
     peak = torch.cuda.max_memory_allocated() / 2**30 if torch.cuda.is_available() else float("nan")
 
-    n_pairs = c["n_pairs"] or 3_060_000        # E4: folds-3/4 positives
-    n_texts = 24_200_000                       # E4 / phase0: all S1 + S2 + S3, train + test
+    n_pairs, n_texts = data_sizes()
+    if c["n_pairs"]:
+        n_pairs = min(n_pairs, c["n_pairs"]) if n_pairs else c["n_pairs"]
     train_h = n_pairs / B / step_rate / 3600 * c["epochs"]
     enc_h = n_texts / enc_rate / 3600
     print(f"\nencoding : {enc_rate:,.0f} texts/s  (max_len {c['max_len']}, batch {c['encode_batch']})")
     print(f"training : {step_rate:.2f} steps/s at batch {B}  (peak VRAM {peak:.1f} GB)")
     print(f"estimates: train encoder on {n_pairs:,} pairs ~ {train_h:.1f} h | "
           f"encode all {n_texts:,} texts (search) ~ {enc_h:.1f} h | recall gate ~ "
-          f"{(2_300_000 + 40_000) / enc_rate / 3600:.2f} h")
-    budget_h = 3.0
+          f"{(n_texts_train_s1() + 2 * c['eval_records']) / enc_rate / 3600:.2f} h")
+    budget_h = c.get("train_budget_h", 3.0)
     if train_h > budget_h:
         suggest = int(budget_h * 3600 * step_rate * B / c["epochs"])
         print(f"SUGGESTION: training exceeds {budget_h:.0f} h -> set v5.neural.n_pairs to ~{suggest:,} "
               f"(or use intfloat/multilingual-e5-small)")
+
+
+def n_texts_train_s1() -> int:
+    """Rows of train S1 (the recall gate encodes all of them)."""
+    import pyarrow.parquet as pq
+    from ..store import norm_path
+    return pq.ParquetFile(norm_path("train", 1)).metadata.num_rows
 
 
 if __name__ == "__main__":

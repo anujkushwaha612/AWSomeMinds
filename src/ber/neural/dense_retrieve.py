@@ -96,6 +96,11 @@ def run_country(enc, split: str, country: str, log=print) -> None:
     # cosine for every TF-IDF candidate, in file order
     tf = pq.read_table(artifact_path(vdir("tfidf"), split, f"{country}.parquet"),
                        columns=["src", "doc_row", "s1_row"]).to_pandas()
+    for s, n in ((1, "s1_row"), (2, "doc_row"), (3, "doc_row")):     # row universes must agree
+        rows = tf[n] if s == 1 else tf.loc[tf["src"] == s, n]
+        if len(rows) and rows.max() >= st.n(s):
+            raise ValueError(f"{split}/{country}: TF-IDF rows index beyond the store (S{s}); "
+                             f"the TF-IDF run and v5.limit disagree")
     cos = np.empty(len(tf), dtype=np.float32)
     for src in (2, 3):
         mm = (tf["src"] == src).to_numpy()
@@ -117,8 +122,22 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--split", required=True, choices=["train", "test"])
     ap.add_argument("--country", default=None)
+    ap.add_argument("--allow-base-model", action="store_true",
+                    help="search with the pretrained model if no fine-tuned one exists (not for real runs)")
     args = ap.parse_args()
-    enc = Encoder()
+    import json
+    from .common import model_dir
+    state_path = os.path.join(model_dir(), "train_state.json")
+    if os.path.exists(state_path):
+        st = json.load(open(state_path))
+        if st["step"] < st["total"]:
+            raise SystemExit(f"encoder training is incomplete ({st['step']}/{st['total']} steps): "
+                             f"finish train_biencoder first")
+        enc = Encoder(model_dir())
+    elif args.allow_base_model:
+        enc = Encoder(ncfg()["model"])
+    else:
+        raise SystemExit("no fine-tuned encoder in " + model_dir() + ": run train_biencoder first")
     print(f"encoder: {enc.path}", flush=True)
     for country in ([args.country] if args.country else split_countries(args.split)):
         run_country(enc, args.split, country, log=lambda s: print(s, flush=True))

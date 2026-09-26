@@ -78,9 +78,13 @@ def device():
 
 
 def amp_dtype():
-    """bfloat16 where supported (Ampere+), else float16."""
+    """bfloat16 on GPUs with native bf16 tensor cores (compute capability >= 8.0), else float16.
+
+    ``torch.cuda.is_bf16_supported()`` is also True on Turing (T4) where bf16 is emulated and
+    slow, so the capability is checked instead.
+    """
     import torch
-    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+    if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8:
         return torch.bfloat16
     return torch.float16
 
@@ -100,27 +104,49 @@ class Encoder:
         self.model = AutoModel.from_pretrained(path).to(self.dev)
         self.torch = torch
 
-    def forward(self, texts: list[str]):
-        """Normalized embeddings with gradients (training)."""
-        t = self.tok(texts, padding=True, truncation=True, max_length=self.max_len,
-                     return_tensors="pt").to(self.dev)
+    def tokenize(self, texts: list[str]):
+        """CPU tokenization (pinned memory when a GPU is used, for async copies)."""
+        t = self.tok(texts, padding=True, truncation=True, max_length=self.max_len, return_tensors="pt")
+        if self.dev.type == "cuda":
+            t = {k: v.pin_memory() for k, v in t.items()}
+        return t
+
+    def embed(self, t):
+        """Mean-pooled, L2-normalized embeddings from a tokenized batch (float32 math)."""
+        t = {k: v.to(self.dev, non_blocking=True) for k, v in t.items()}
         out = self.model(**t).last_hidden_state
         mask = t["attention_mask"].unsqueeze(-1).to(out.dtype)
-        emb = (out * mask).sum(1) / mask.sum(1).clamp(min=1e-6)
+        emb = (out * mask).sum(1).float() / mask.sum(1).float().clamp(min=1e-6)
         return self.torch.nn.functional.normalize(emb, dim=-1)
 
+    def forward(self, texts: list[str]):
+        """Normalized embeddings with gradients (training)."""
+        return self.embed(self.tokenize(texts))
+
     def encode(self, texts: list[str], batch: int | None = None):
-        """Normalized float16 embeddings on the device, in input order (length-sorted batches)."""
+        """Normalized float16 embeddings on the device, in input order.
+
+        Batches are length-sorted (less padding) and the next batch is tokenized on a CPU
+        thread while the GPU runs the current one (HF fast tokenizers release the GIL).
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
         torch = self.torch
         batch = batch or ncfg()["encode_batch"]
         self.model.eval()
         order = length_order(texts)
         out = torch.empty((len(texts), self.model.config.hidden_size), dtype=torch.float16,
                           device=self.dev)
+        starts = list(range(0, len(texts), batch))
         use_amp = self.dev.type == "cuda"
-        with torch.inference_mode(), torch.autocast(self.dev.type, dtype=amp_dtype(), enabled=use_amp):
-            for i in range(0, len(texts), batch):
-                idx = order[i:i + batch]
-                emb = self.forward([texts[j] for j in idx])
-                out[torch.as_tensor(idx, device=self.dev)] = emb.to(torch.float16)
+        with ThreadPoolExecutor(max_workers=1) as ex, torch.inference_mode(), \
+                torch.autocast(self.dev.type, dtype=amp_dtype(), enabled=use_amp):
+            nxt = ex.submit(self.tokenize, [texts[j] for j in order[0:batch]]) if starts else None
+            for n, i in enumerate(starts):
+                t = nxt.result()
+                if n + 1 < len(starts):
+                    a = starts[n + 1]
+                    nxt = ex.submit(self.tokenize, [texts[j] for j in order[a:a + batch]])
+                idx = torch.as_tensor(order[i:i + batch], device=self.dev)
+                out[idx] = self.embed(t).to(torch.float16)
         return out

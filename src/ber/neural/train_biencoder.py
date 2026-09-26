@@ -41,24 +41,57 @@ def make_batches(pairs: pd.DataFrame, batch: int, same_country: bool, seed: int)
 
 
 def texts_for_batch(stores: dict, pairs: pd.DataFrame, idx: np.ndarray):
-    """(record, positive S1, negative S1) texts for one batch, grouped per country and source."""
+    """(record, positive S1, negative S1) texts for one batch, per country and source.
+
+    Works for mixed-country batches too (``same_country_batches: false``).
+    """
     sub = pairs.iloc[idx]
-    code = int(sub["country"].iloc[0])
-    st = stores[code]
-    q = [None] * len(sub)
-    src = sub["src"].to_numpy()
-    for s in (2, 3):
-        m = np.flatnonzero(src == s)
-        if len(m):
-            for j, t in zip(m, store_texts(st, s, sub["doc_row"].to_numpy()[m])):
-                q[j] = t
-    p = store_texts(st, 1, sub["pos_s1"].to_numpy())
-    n = store_texts(st, 1, sub["neg_s1"].to_numpy())
+    q, p, n = [None] * len(sub), [None] * len(sub), [None] * len(sub)
+    country, src = sub["country"].to_numpy(), sub["src"].to_numpy()
+    for code in np.unique(country):
+        st = stores[int(code)]
+        mc = np.flatnonzero(country == code)
+        for j, t in zip(mc, store_texts(st, 1, sub["pos_s1"].to_numpy()[mc])):
+            p[j] = t
+        for j, t in zip(mc, store_texts(st, 1, sub["neg_s1"].to_numpy()[mc])):
+            n[j] = t
+        for s in (2, 3):
+            m = mc[src[mc] == s]
+            if len(m):
+                for j, t in zip(m, store_texts(st, s, sub["doc_row"].to_numpy()[m])):
+                    q[j] = t
     return q, p, n
 
 
+def false_negative_mask(pairs: pd.DataFrame, idx: np.ndarray) -> np.ndarray:
+    """[B, 2B] True where column j is ANOTHER row's S1 that is in fact row i's parent.
+
+    Columns = the batch's positives, then its hard negatives. Records of one entity (it has
+    3.5 matches on average) can share a batch, and a hard negative can be another row's
+    parent: those columns are true matches and must not be pushed away.
+    """
+    sub = pairs.iloc[idx]
+    ent = (sub["country"].to_numpy(np.int64) << 32) | sub["pos_s1"].to_numpy(np.int64)
+    neg = (sub["country"].to_numpy(np.int64) << 32) | sub["neg_s1"].to_numpy(np.int64)
+    cols = np.concatenate([ent, neg])
+    mask = ent[:, None] == cols[None, :]
+    np.fill_diagonal(mask[:, :len(ent)], False)       # the row's own positive stays the target
+    return mask
+
+
+def run_fingerprint(pairs: pd.DataFrame, c: dict) -> str:
+    """Identifies a training run; a checkpoint is resumed only if this matches."""
+    import hashlib
+    keys = ["model", "max_len", "batch_size", "lr", "epochs", "scale", "warmup", "same_country_batches"]
+    raw = json.dumps({k: c[k] for k in keys}, sort_keys=True) + f"|{len(pairs)}|{int(pairs['doc_row'].sum())}"
+    return hashlib.sha1(raw.encode()).hexdigest()[:16]
+
+
 def train(max_steps: int | None = None) -> None:
-    """Fine-tune and save the encoder."""
+    """Fine-tune and save the encoder (resumes only a checkpoint of the same run)."""
+    import shutil
+    from concurrent.futures import ThreadPoolExecutor
+
     import torch
     from transformers import get_linear_schedule_with_warmup
 
@@ -69,66 +102,88 @@ def train(max_steps: int | None = None) -> None:
     stores = {code: country_store("train", country, cols=["name_n", "addr_n"])
               for code, country in enumerate(names) if (pairs["country"] == code).any()}
     ckpt = model_dir()
-    resume = os.path.isdir(ckpt) and os.path.exists(os.path.join(ckpt, "train_state.json"))
-    enc = Encoder(ckpt if resume else c["model"])
-    enc.model.train()
+    fp = run_fingerprint(pairs, c)
+    state_path = os.path.join(ckpt, "train_state.json")
+    state = json.load(open(state_path)) if os.path.exists(state_path) else None
+    if state and state.get("fingerprint") != fp:
+        print("checkpoint belongs to a different run (config or pairs changed): starting fresh", flush=True)
+        shutil.rmtree(ckpt)
+        state = None
     batches = []
     for ep in range(c["epochs"]):
         batches += make_batches(pairs, c["batch_size"], c["same_country_batches"], seed + ep)
     total = len(batches) if max_steps is None else min(max_steps, len(batches))
-    opt = torch.optim.AdamW(enc.model.parameters(), lr=c["lr"], weight_decay=0.01)
+    if state and state["step"] >= total:
+        print(f"encoder already trained ({state['step']:,}/{total:,} steps): skipping training", flush=True)
+        return
+    enc = Encoder(ckpt if state else c["model"])
+    enc.model.train()
+    opt = torch.optim.AdamW(enc.model.parameters(), lr=c["lr"], weight_decay=c.get("weight_decay", 0.01))
     sched = get_linear_schedule_with_warmup(opt, int(c["warmup"] * total), total)
     use_amp = enc.dev.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp and amp_dtype() == torch.float16)
     start = 0
-    if resume:
-        state = json.load(open(os.path.join(ckpt, "train_state.json")))
+    if state:
         start = state["step"]
-        opt_path = os.path.join(ckpt, "optimizer.pt")
-        if os.path.exists(opt_path):
-            s = torch.load(opt_path, map_location=enc.dev)
-            opt.load_state_dict(s["opt"])
-            sched.load_state_dict(s["sched"])
+        s = torch.load(os.path.join(ckpt, "optimizer.pt"), map_location=enc.dev)
+        opt.load_state_dict(s["opt"])
+        sched.load_state_dict(s["sched"])
         print(f"resuming from step {start:,}/{total:,}", flush=True)
+    every_log, every_ckpt = c.get("log_every", 100), c.get("checkpoint_every", 2000)
     labels = None
     t0, losses = time.time(), []
-    for step in range(start, total):
-        q, p, n = texts_for_batch(stores, pairs, batches[step])
-        with torch.autocast(enc.dev.type, dtype=amp_dtype(), enabled=use_amp):
-            eq = enc.forward(q)
-            ed = enc.forward(p + n)                       # positives then hard negatives
-            logits = (eq @ ed.T).float() * c["scale"]
-        if labels is None or len(labels) != len(q):
-            labels = torch.arange(len(q), device=enc.dev)
-        loss = torch.nn.functional.cross_entropy(logits, labels)
-        opt.zero_grad(set_to_none=True)
-        scaler.scale(loss).backward()
-        scaler.unscale_(opt)
-        torch.nn.utils.clip_grad_norm_(enc.model.parameters(), 1.0)
-        scaler.step(opt)
-        scaler.update()
-        sched.step()
-        losses.append(float(loss))
-        done = step + 1
-        if done % 100 == 0 or done == total:
-            rate = (done - start) / (time.time() - t0)
-            print(f"step {done:,}/{total:,}  loss {np.mean(losses[-100:]):.4f}  {rate:.2f} steps/s  "
-                  f"ETA {(total - done) / max(rate, 1e-9) / 60:.0f} min", flush=True)
-        if done % 2000 == 0 or done == total:
-            os.makedirs(ckpt, exist_ok=True)
-            enc.model.save_pretrained(ckpt)
-            enc.tok.save_pretrained(ckpt)
-            torch.save({"opt": opt.state_dict(), "sched": sched.state_dict()},
-                       os.path.join(ckpt, "optimizer.pt"))
-            json.dump({"step": done, "total": total}, open(os.path.join(ckpt, "train_state.json"), "w"))
+
+    def prepare(step):
+        """CPU work for one step, run on a helper thread while the GPU trains."""
+        idx = batches[step]
+        q, p, n = texts_for_batch(stores, pairs, idx)
+        return enc.tokenize(q), enc.tokenize(p + n), false_negative_mask(pairs, idx)
+
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        nxt = ex.submit(prepare, start) if start < total else None
+        for step in range(start, total):
+            tq, td, fn = nxt.result()
+            if step + 1 < total:
+                nxt = ex.submit(prepare, step + 1)
+            with torch.autocast(enc.dev.type, dtype=amp_dtype(), enabled=use_amp):
+                eq = enc.embed(tq)                     # float32 embeddings
+                ed = enc.embed(td)                     # positives then hard negatives
+            logits = (eq @ ed.T) * c["scale"]          # float32 similarity / loss
+            logits = logits.masked_fill(torch.as_tensor(fn, device=enc.dev), float("-inf"))
+            if labels is None or len(labels) != len(eq):
+                labels = torch.arange(len(eq), device=enc.dev)
+            loss = torch.nn.functional.cross_entropy(logits, labels)
+            opt.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(enc.model.parameters(), c.get("grad_clip", 1.0))
+            scaler.step(opt)
+            scaler.update()
+            sched.step()
+            losses.append(float(loss))
+            done = step + 1
+            if done % every_log == 0 or done == total:
+                rate = (done - start) / (time.time() - t0)
+                print(f"step {done:,}/{total:,}  loss {np.mean(losses[-every_log:]):.4f}  {rate:.2f} steps/s  "
+                      f"ETA {(total - done) / max(rate, 1e-9) / 60:.0f} min", flush=True)
+            if done % every_ckpt == 0 or done == total:
+                os.makedirs(ckpt, exist_ok=True)
+                enc.model.save_pretrained(ckpt)
+                enc.tok.save_pretrained(ckpt)
+                torch.save({"opt": opt.state_dict(), "sched": sched.state_dict()},
+                           os.path.join(ckpt, "optimizer.pt.tmp"))
+                os.replace(os.path.join(ckpt, "optimizer.pt.tmp"), os.path.join(ckpt, "optimizer.pt"))
+                json.dump({"step": done, "total": total, "fingerprint": fp}, open(state_path + ".tmp", "w"))
+                os.replace(state_path + ".tmp", state_path)   # state last: marks the checkpoint complete
     print(f"saved fine-tuned encoder -> {ckpt}", flush=True)
 
 
-def recall_gate(k: int = 5) -> dict:
+def recall_gate(k: int | None = None) -> dict:
     """Record-side recall of the fold-0 sample against the full S1 universe, dense vs TF-IDF."""
     import torch
 
     c = ncfg()
+    k = k or c.get("gate_k", 5)
     ev = pd.read_parquet(artifact_path(vdir("neural"), "eval_records.parquet"))
     enc = Encoder(model_dir() if os.path.isdir(model_dir()) else c["model"])
     report = {"encoder": enc.path}
@@ -157,7 +212,7 @@ def recall_gate(k: int = 5) -> dict:
             if not mask.any():
                 continue
             r = ranks[mask]
-            row[name] = {f"dense_R@{j}": float(((r >= 0) & (r < j)).mean()) for j in (1, 3, 5)}
+            row[name] = {f"dense_R@{j}": float(((r >= 0) & (r < j)).mean()) for j in sorted({1, 3, k})}
             row[name].update({f"tfidf_R@{j}": float(((tr[mask] >= 0) & (tr[mask] < j)).mean())
                               for j in (1, 3)})
             row[name]["union_R@3+3"] = float((((r >= 0) & (r < 3)) | ((tr[mask] >= 0) & (tr[mask] < 3))).mean())

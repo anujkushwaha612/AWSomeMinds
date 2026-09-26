@@ -64,12 +64,12 @@ def retrieval_features(cand: pd.DataFrame) -> pd.DataFrame:
     """Add record-side and S1-side retrieval features (numeric columns only)."""
     rec = cand.groupby(["src", "doc_row"], sort=False)["score"]
     cand["gap_rec"] = (rec.transform("max") - cand["score"]).astype(np.float32)
-    cand["n_cand_rec"] = rec.transform("size").astype(np.int16)
+    cand["n_cand_rec"] = rec.transform("size").astype(np.int32)
     s1src = cand.groupby(["s1_row", "src"], sort=False)["score"]
-    cand["rank_s1"] = (s1src.rank(ascending=False, method="first") - 1).astype(np.int16)
+    cand["rank_s1"] = (s1src.rank(ascending=False, method="first") - 1).astype(np.int32)
     cand["gap_s1"] = (s1src.transform("max") - cand["score"]).astype(np.float32)
-    cand["n_cand_s1_src"] = s1src.transform("size").astype(np.int16)
-    cand["n_cand_s1"] = cand.groupby("s1_row", sort=False)["score"].transform("size").astype(np.int16)
+    cand["n_cand_s1_src"] = s1src.transform("size").astype(np.int32)
+    cand["n_cand_s1"] = cand.groupby("s1_row", sort=False)["score"].transform("size").astype(np.int32)
     return cand
 
 

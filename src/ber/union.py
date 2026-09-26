@@ -30,7 +30,17 @@ from .store import split_countries
 DENSE_FEATURES = ["in_tfidf", "cos", "drank_rec", "drank_s1", "in_dense", "dgap_rec",
                   "drank_rec_all", "dgap_s1", "drank_s1_all", "n_retrievers"]
 FEATURES_V5 = FEATURES + DENSE_FEATURES
-ABSENT_RANK = 9
+
+
+def _absent_rank() -> int:
+    """Rank value meaning "not in this retriever's list": one past the largest configured k."""
+    from .config import load_config
+    cfg = load_config()
+    v = cfg["v5"]["neural"]
+    return int(max(cfg["baseline"]["k_rec"], v["k_rec"], v["k_s1"])) + 1
+
+
+ABSENT_RANK = _absent_rank()
 
 
 def pair_key(src, doc_row, s1_row) -> np.ndarray:
@@ -79,24 +89,27 @@ def dense_group_features(cand: pd.DataFrame) -> pd.DataFrame:
     """Cosine gaps / ranks within the record's and the S1's (per source) union candidates."""
     rec = cand.groupby(["src", "doc_row"], sort=False)["cos"]
     cand["dgap_rec"] = (rec.transform("max") - cand["cos"]).astype(np.float32)
-    cand["drank_rec_all"] = (rec.rank(ascending=False, method="first") - 1).astype(np.int16)
+    cand["drank_rec_all"] = (rec.rank(ascending=False, method="first") - 1).astype(np.int32)
     s1 = cand.groupby(["s1_row", "src"], sort=False)["cos"]
     cand["dgap_s1"] = (s1.transform("max") - cand["cos"]).astype(np.float32)
-    cand["drank_s1_all"] = (s1.rank(ascending=False, method="first") - 1).astype(np.int16)
+    cand["drank_s1_all"] = (s1.rank(ascending=False, method="first") - 1).astype(np.int32)
     return cand
 
 
-def build(split: str, force: bool = False, feature_chunk: int = 500_000) -> None:
+def build(split: str, force: bool = False, feature_chunk: int | None = None) -> None:
     """Union candidates + features for every country of ``split``."""
     from .baseline import truth_parents
     from .io import load_truth_pairs
     from .neural.common import v5cfg
 
     v = v5cfg()
+    from .config import load_config
+    feature_chunk = feature_chunk or load_config()["baseline"]["feature_chunk"]
     truth = load_truth_pairs() if split == "train" else None
     for country in split_countries(split):
         out = artifact_path(vdir("union"), split, f"{country}.parquet")
-        if os.path.exists(out) and not force:
+        ents_out = artifact_path(vdir("union"), split, f"{country}_entities.parquet")
+        if os.path.exists(out) and os.path.exists(ents_out) and not force:
             print(f"[union {split}/{country}] exists, skipping", flush=True)
             continue
         t0 = time.time()

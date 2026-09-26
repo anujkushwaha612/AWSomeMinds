@@ -9,7 +9,7 @@
             retrieval candidate), so this *under*-states the real density effect.
   france    Label-free diagnostics of test predictions per country vs train fold 0.
   probe     Copy of output/matching_results.tsv with France rows emptied (an optional
-            leaderboard probe: LB delta = France share x (F_France - France singleton share)).
+            leaderboard probe: LB(full) - LB(emptied) = country share x (F_country - singleton share of country)).
 
 Run:  python -m ber.gap stress --run v5        (or --run baseline)
       python -m ber.gap france
@@ -131,11 +131,13 @@ def france() -> dict:
     return out
 
 
-def probe(name: str) -> None:
-    """Write subs/<name>/ = current matching results with every France row emptied."""
+def probe(name: str, country: str) -> None:
+    """Write subs/<name>/ = current matching results with every row of ``country`` emptied."""
     from .submit import finalize_submission
 
-    fr = set(country_store("test", "France", cols=["entity_id"]).numpy(1, "entity_id").tolist())
+    if country not in split_countries("test"):
+        raise SystemExit(f"{country!r} is not a test country: {split_countries('test')}")
+    fr = set(country_store("test", country, cols=["entity_id"]).numpy(1, "entity_id").tolist())
     src = REPO_ROOT / "output" / "matching_results.tsv"
     tmp = REPO_ROOT / "output" / "matching_results_probe.tsv"
     n = 0
@@ -148,9 +150,11 @@ def probe(name: str) -> None:
                 n += 1
             else:
                 fo.write(line)
-    print(f"emptied {n:,} France rows")
+    if n == 0:
+        raise SystemExit(f"no {country} rows found in {src}")
+    print(f"emptied {n:,} {country} rows")
     finalize_submission(name, str(tmp), str(REPO_ROOT / "output" / "candidate_pairs.tsv"),
-                        notes="probe: France rows emptied")
+                        notes=f"probe: {country} rows emptied")
     shutil.move(str(tmp), str(REPO_ROOT / "subs" / name / "matching_results_probe.tsv"))
 
 
@@ -161,7 +165,8 @@ def main() -> None:
     s.add_argument("--run", default="v5", choices=["v5", "baseline"])
     sub.add_parser("france")
     pr = sub.add_parser("probe")
-    pr.add_argument("--name", default="probe_france_empty")
+    pr.add_argument("--name", default="probe_country_empty")
+    pr.add_argument("--country", default="France", help="test country whose rows are emptied")
     args = ap.parse_args()
     os.makedirs(artifact_path("experiments"), exist_ok=True)
     if args.cmd == "stress":
@@ -169,7 +174,7 @@ def main() -> None:
     elif args.cmd == "france":
         france()
     else:
-        probe(args.name)
+        probe(args.name, args.country)
 
 
 if __name__ == "__main__":

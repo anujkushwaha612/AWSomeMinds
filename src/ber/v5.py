@@ -138,21 +138,33 @@ def lgb_params() -> dict:
                                                if k not in ("num_rounds", "early_stopping")}}
 
 
-def cross_fit(Xtr: np.ndarray, ytr: np.ndarray, fsub: np.ndarray, names: list[str], tag: str) -> list:
-    """One LightGBM per gbdt fold f, trained on the given rows with fold != f (10% early stop).
+def entity_uniform(ent_keys: np.ndarray, salt: int) -> np.ndarray:
+    """Deterministic U(0,1) per entity key (all rows of one entity get the same value)."""
+    x = (ent_keys.astype(np.uint64) + np.uint64(salt)) * np.uint64(0x9E3779B97F4A7C15)
+    x ^= x >> np.uint64(31)
+    return (x >> np.uint64(11)).astype(np.float64) / float(1 << 53)
 
-    ``Xtr`` holds only training rows; it is binned once and the caller should drop it.
+
+def cross_fit(Xtr: np.ndarray, ytr: np.ndarray, fsub: np.ndarray, ent: np.ndarray,
+              names: list[str], tag: str) -> list:
+    """One LightGBM per gbdt fold f, trained on the given rows with fold != f.
+
+    Early stopping uses ``v5.early_stop_share`` of the training ENTITIES (all their rows),
+    so fit and validation rows never share an entity. ``Xtr`` is binned once; pass it
+    without keeping another reference so its memory is released during boosting.
     """
     c = vcfg()
     params = lgb_params()
     full = lgb.Dataset(Xtr, ytr, feature_name=names, params=params, free_raw_data=True)
     full.construct()
-    es_u = np.random.default_rng(load_config()["seed"] + 7).random(len(ytr))
+    del Xtr
+    gc.collect()
+    es_u = entity_uniform(ent, load_config()["seed"] + 7)
     models = []
     for f in c["gbdt_folds"]:
         t = time.time()
         tr = fsub != f
-        es = tr & (es_u < 0.1)
+        es = tr & (es_u < c.get("early_stop_share", 0.1))
         booster = lgb.train(params, full.subset(np.flatnonzero(tr & ~es)), c["lgb"]["num_rounds"],
                             valid_sets=[full.subset(np.flatnonzero(es))],
                             callbacks=[lgb.early_stopping(c["lgb"]["early_stopping"], verbose=False)])
@@ -394,10 +406,9 @@ def stage1() -> None:
     train_mask = in_gbdt & (u < frac)
     log.info(f"[stage1] {len(keys):,} union pairs; training rows {int(train_mask.sum()):,} "
              f"(gbdt folds {v['gbdt_folds']}, entity share {frac:.3f}) {mem_str()}")
-    Xtr = read_matrix("train", train_mask)
-    log.info(f"[stage1] training matrix {Xtr.shape} {Xtr.nbytes / 2**30:.2f} GB {mem_str()}")
-    models = cross_fit(Xtr, y[train_mask], fold[train_mask], FEATURES_V5, "stage1")
-    del Xtr
+    ent_all = entity_key(keys["country"], keys["s1_row"])
+    models = cross_fit(read_matrix("train", train_mask), y[train_mask], fold[train_mask],
+                       ent_all[train_mask], FEATURES_V5, "stage1")
     gc.collect()
     p1 = predict_stream(models, "train", fold, len(keys))
     np.save(run_path("p1_train.npy"), p1)
@@ -436,6 +447,8 @@ def stage2() -> None:
     v = vcfg()
     keys, ents = read_keys("train")
     p1 = np.load(run_path("p1_train.npy"))
+    if len(p1) != len(keys):
+        raise ValueError(f"p1_train has {len(p1)} rows for {len(keys)} train pairs: rerun stage1")
     kept = p1 >= v["prune_tau"]
     kk = keys[kept].reset_index(drop=True)
     y = kk["label"].to_numpy()
@@ -445,7 +458,8 @@ def stage2() -> None:
         in_gbdt &= ~encoder_seen(kk)
     X = stage2_matrix("train", keys, p1, kept)
     log.info(f"[stage2] pruned to {len(kk):,} pairs (tau {v['prune_tau']}); matrix {X.shape} {mem_str()}")
-    models = cross_fit(X[in_gbdt], y[in_gbdt], fold[in_gbdt], FEATURES_S2, "stage2")
+    models = cross_fit(X[in_gbdt], y[in_gbdt], fold[in_gbdt],
+                       entity_key(kk["country"], kk["s1_row"])[in_gbdt], FEATURES_S2, "stage2")
     p2 = predict_cross(models, X, fold)
     np.save(run_path("p2_train.npy"), p2)
     np.save(run_path("kept_train.npy"), kept)
@@ -467,7 +481,9 @@ def predict(name: str) -> None:
     res = json.load(open(run_path("stage2.json")))
     keys, _ = read_keys("test")
     p1 = np.load(run_path("p1_test.npy"))
-    kept = p1 >= v["prune_tau"]
+    if len(p1) != len(keys):
+        raise ValueError(f"p1_test has {len(p1)} rows for {len(keys)} test pairs: rerun stage1")
+    kept = p1 >= res["prune_tau"]                 # the tau stage 2 was trained with
     kk = keys[kept].reset_index(drop=True)
     X = stage2_matrix("test", keys, p1, kept)
     p2 = predict_cross(load_models("stage2"), X, None)
@@ -501,8 +517,9 @@ def predict(name: str) -> None:
 
 
 # ------------------------------------------------------------------ compare
-def compare(baseline_run: str = "baseline") -> None:
+def compare(baseline_run: str | None = None) -> None:
     """Paired bootstrap on fold-0 entities: v5 stage 1 / stage 2 vs the baseline run."""
+    baseline_run = baseline_run or vdir("tfidf")
     boot = load_config()["bootstrap"]
     base_dir = artifact_path(baseline_run)
     bm = json.load(open(os.path.join(base_dir, "metrics.json")))
@@ -535,7 +552,7 @@ def main() -> None:
     p = sub.add_parser("predict")
     p.add_argument("--name", required=True)
     c = sub.add_parser("compare")
-    c.add_argument("--baseline", default="baseline")
+    c.add_argument("--baseline", default=None, help="baseline run folder (default: v5.tfidf_run)")
     args = ap.parse_args()
     setup_logging()
     if args.cmd == "stage1":

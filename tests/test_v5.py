@@ -84,3 +84,33 @@ def test_make_batches_same_country():
     assert len(b) == 4                                      # full batches only (2 + 2)
     for idx in b:
         assert len(set(pairs["country"].to_numpy()[idx])) == 1
+
+
+def test_sibling_in_group_only_allowed_and_never_self():
+    from ber.neural.pairs import sibling_in_group
+    keys = pd.Series(["subway", "subway", "subway", "cafe", "", "cafe"])
+    allowed = np.array([True, True, False, True, True, False])
+    out = sibling_in_group(keys, allowed)
+    assert out[0] == 1 and out[1] == 0            # cyclic within allowed rows of the group
+    assert out[2] == -1 and out[5] == -1          # not allowed -> no sibling
+    assert out[3] == -1 and out[4] == -1          # singleton group / empty key
+
+
+def test_false_negative_mask():
+    from ber.neural.train_biencoder import false_negative_mask
+    # rows 0 and 1 share parent 7 (two records of one entity); row 2's hard negative is 7
+    pairs = pd.DataFrame({"country": [0, 0, 0], "pos_s1": [7, 7, 9], "neg_s1": [5, 6, 7]})
+    m = false_negative_mask(pairs, np.arange(3))
+    assert m.shape == (3, 6)
+    assert m[0, 1] and m[1, 0]                    # the other row's positive is my parent
+    assert not m[0, 0] and not m[1, 1]            # own positive stays the target
+    assert m[0, 5] and m[1, 5]                    # row 2's hard negative is my parent
+    assert not m[2].any()
+
+
+def test_entity_uniform_is_per_entity_and_deterministic():
+    from ber.v5 import entity_uniform
+    k = np.array([5, 5, 9, 12345678901], dtype=np.int64)
+    u = entity_uniform(k, 7)
+    assert u[0] == u[1] and 0 <= u.min() and u.max() < 1
+    assert np.array_equal(u, entity_uniform(k, 7)) and not np.array_equal(u, entity_uniform(k, 8))

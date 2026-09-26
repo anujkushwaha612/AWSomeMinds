@@ -73,7 +73,14 @@ v5:
     k_rec: 3                  # E4: TF-IDF finds 97-98% of found parents at rank 0; ranks 1-2 add 2-3 pp
     k_s1: 5                   # E4: S1-side list per source; per-source true matches <= 5 for 100% (S2) / 99.9% (S3)
     tile_gb: 6.0              # similarity tile size on the GPU
+    gate_k: 5                 # recall gate: report R@1 / R@3 / R@gate_k
+    weight_decay: 0.01        # [L]
+    grad_clip: 1.0            # [L]
+    log_every: 100            # training log interval (steps)
+    checkpoint_every: 2000    # resumable checkpoint interval (steps)
+    train_budget_h: 3.0       # env_check suggests fewer pairs if training would exceed this
   drop_encoder_records: false # true = remove encoder-seen records from the train GBDT universe (leakage check fallback)
+  early_stop_share: 0.1       # share of training ENTITIES held out for LightGBM early stopping
   prune_tau: 0.003            # E4: 14.0 -> 5.05 candidates/S1 at oracle loss 0.00004
   train_frac: 1.0             # share of gbdt-fold entities per fold model (60% of all entities in total)
   max_train_rows: 20000000    # memory cap for stage 1 on 15.7 GB RAM (~3 GB float32 at 37 features)
