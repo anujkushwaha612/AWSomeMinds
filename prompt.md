@@ -101,7 +101,7 @@ If the test unmatched share is clearly above train's (~26%), the decoy rate is h
 examples per error type. Look for the next generator rule the features still miss. Remaining weakest buckets:
 k=1 (0.907), singletons (0.956).
 
-**E7c — raise the candidate ceiling (never-retrieved = 0.015 of F).** Misses are concentrated in: Indic-script
+**E7c — raise the candidate ceiling (never-retrieved = 0.015 of F). Full task spec: [prompt_tfidf.md](prompt_tfidf.md) (now priority 1).** Misses are concentrated in: Indic-script
 names (63% of India S2 misses), empty addresses (22–49%), chain names, domain / garbled names. For fold-0 missed
 records, measure whether alternative retrieval views find the parent in top-k and at what cost in candidates/S1:
 transliterated `name_tr + addr_tr` TF-IDF, name-only for empty-address records, address-only for trade names,
