@@ -176,11 +176,59 @@ def encoder_seen(keys: pd.DataFrame) -> np.ndarray:
     return pd.Series(rec).isin(seen).to_numpy()
 
 
-def lgb_params() -> dict:
-    c = vcfg()
+def lgb_cfg(tag: str = "") -> dict:
+    """v5.lgb, with v5.lgb_stage2 overrides for stage-2 models (tag starting with 'stage2')."""
+    c = dict(vcfg()["lgb"])
+    if tag.startswith("stage2"):
+        c.update(vcfg().get("lgb_stage2") or {})
+    return c
+
+
+def lgb_params(tag: str = "") -> dict:
     return {"objective": "binary", "verbosity": -1, "num_threads": os.cpu_count(),
-            "seed": load_config()["seed"], **{k: v for k, v in c["lgb"].items()
+            "seed": load_config()["seed"], **{k: v for k, v in lgb_cfg(tag).items()
                                                if k not in ("num_rounds", "early_stopping")}}
+
+
+class UnionRowsSeq(lgb.Sequence):
+    """Selected rows of a split's union feature files (global row order) as a LightGBM Sequence.
+
+    Read block by block, so the float matrix of all training rows never exists in memory; LightGBM builds its
+    binned dataset from sequential slices when a reference dataset (the bin boundaries) is given.
+    """
+
+    def __init__(self, split: str, rows_mask: np.ndarray, names: list[str], batch: int = 500_000):
+        self.split, self.mask, self.names = split, rows_mask, names
+        self.n = int(rows_mask.sum())
+        self.batch_size = batch
+        self._gen, self._buf, self._lo = None, None, 0
+
+    def __len__(self) -> int:
+        return self.n
+
+    def _blocks(self):
+        off = 0
+        for country in split_countries(self.split):
+            pf = pq.ParquetFile(feat_path(self.split, country))
+            for rb in pf.iter_batches(batch_size=1_000_000, columns=self.names):
+                sel = self.mask[off:off + rb.num_rows]
+                off += rb.num_rows
+                if sel.any():
+                    yield np.column_stack([rb.column(i).to_numpy(zero_copy_only=False).astype(np.float32)
+                                           for i in range(rb.num_columns)])[sel]
+
+    def __getitem__(self, idx):
+        if not isinstance(idx, slice):
+            raise TypeError("UnionRowsSeq supports sequential slices only (build it with a reference dataset)")
+        start, stop = idx.start or 0, min(idx.stop if idx.stop is not None else self.n, self.n)
+        if self._gen is None or start < self._lo:
+            self._gen, self._buf, self._lo = self._blocks(), np.empty((0, len(self.names)), np.float32), 0
+        if start > self._lo:
+            self._buf = self._buf[start - self._lo:]
+            self._lo = start
+        while self._lo + len(self._buf) < stop:
+            self._buf = np.vstack([self._buf, next(self._gen)])
+        return self._buf[:stop - start]
 
 
 def entity_uniform(ent_keys: np.ndarray, salt: int) -> np.ndarray:
@@ -191,7 +239,7 @@ def entity_uniform(ent_keys: np.ndarray, salt: int) -> np.ndarray:
 
 
 def cross_fit(Xtr: np.ndarray, ytr: np.ndarray, fsub: np.ndarray, ent: np.ndarray,
-              names: list[str], tag: str) -> list:
+              names: list[str], tag: str, dataset=None) -> list:
     """One LightGBM per gbdt fold f, trained on the given rows with fold != f.
 
     Early stopping uses ``v5.early_stop_share`` of the training ENTITIES (all their rows),
@@ -199,8 +247,10 @@ def cross_fit(Xtr: np.ndarray, ytr: np.ndarray, fsub: np.ndarray, ent: np.ndarra
     without keeping another reference so its memory is released during boosting.
     """
     c = vcfg()
-    params = lgb_params()
-    full = lgb.Dataset(Xtr, ytr, feature_name=names, params=params, free_raw_data=True)
+    params = lgb_params(tag)
+    lc = lgb_cfg(tag)
+    full = dataset if dataset is not None else lgb.Dataset(Xtr, ytr, feature_name=names, params=params,
+                                                             free_raw_data=True)
     full.construct()
     del Xtr
     gc.collect()
@@ -210,9 +260,9 @@ def cross_fit(Xtr: np.ndarray, ytr: np.ndarray, fsub: np.ndarray, ent: np.ndarra
         t = time.time()
         tr = fsub != f
         es = tr & (es_u < c.get("early_stop_share", 0.1))
-        booster = lgb.train(params, full.subset(np.flatnonzero(tr & ~es)), c["lgb"]["num_rounds"],
+        booster = lgb.train(params, full.subset(np.flatnonzero(tr & ~es)), lc["num_rounds"],
                             valid_sets=[full.subset(np.flatnonzero(es))],
-                            callbacks=[lgb.early_stopping(c["lgb"]["early_stopping"], verbose=False)])
+                            callbacks=[lgb.early_stopping(lc["early_stopping"], verbose=False)])
         booster.save_model(run_path("models", f"{tag}_fold{f}.txt"))
         booster.free_dataset()
         models.append(booster)
@@ -611,8 +661,22 @@ def stage1() -> None:
              f"(gbdt folds {v['gbdt_folds']}, entity share {frac:.3f}) {mem_str()}")
     ent_all = entity_key(keys["country"], keys["s1_row"])
     names = resolve_features()
-    models = cross_fit(read_matrix("train", train_mask, names), y[train_mask], fold[train_mask],
-                       ent_all[train_mask], names, "stage1")
+    if v.get("stage1_stream", False):
+        # all training rows, streamed: bin boundaries from a 2M-row sample, then rows pushed block by block
+        tr_idx = np.flatnonzero(train_mask)
+        samp = np.zeros(len(keys), dtype=bool)
+        samp[np.random.default_rng(load_config()["seed"] + 11).choice(tr_idx, min(len(tr_idx), 2_000_000),
+                                                                       replace=False)] = True
+        ref = lgb.Dataset(read_matrix("train", samp, names), y[samp], feature_name=names, params=lgb_params("stage1"),
+                          free_raw_data=True).construct()
+        full = lgb.Dataset(UnionRowsSeq("train", train_mask, names), label=y[train_mask], feature_name=names,
+                           reference=ref, params=lgb_params("stage1"), free_raw_data=True)
+        log.info(f"[stage1] streamed training set: {int(train_mask.sum()):,} rows {mem_str()}")
+        models = cross_fit(None, y[train_mask], fold[train_mask], ent_all[train_mask], names, "stage1", dataset=full)
+        del ref, full
+    else:
+        models = cross_fit(read_matrix("train", train_mask, names), y[train_mask], fold[train_mask],
+                           ent_all[train_mask], names, "stage1")
     gc.collect()
     p1 = predict_stream(models, "train", fold, len(keys), names)
     np.save(run_path("p1_train.npy"), p1)

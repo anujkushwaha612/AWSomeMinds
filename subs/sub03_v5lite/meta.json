@@ -1,0 +1,208 @@
+{
+  "name": "sub03_v5lite",
+  "created_utc": "2026-09-26T19:04:44+00:00",
+  "commit": "0e05e29120ebfe70f40330f5c7d6d39f84b8ef4a",
+  "config": {
+    "data_root": "data/dataset",
+    "artifacts_root": "artifacts",
+    "seed": 2026,
+    "validation": {
+      "n_folds": 5,
+      "report_fold": 0,
+      "k_buckets": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ]
+    },
+    "blocking": {
+      "ngram": [
+        3,
+        3
+      ],
+      "min_df": 2,
+      "max_df": 0.1,
+      "views": [
+        "NA",
+        "A",
+        "N"
+      ],
+      "k_forward": 50,
+      "k_reverse": 10,
+      "query_chunk": 20000,
+      "n_threads": 0
+    },
+    "baseline": {
+      "k_rec": 3,
+      "max_df": 0.01,
+      "min_score": 0.0,
+      "workers": 8,
+      "chunk": 50000,
+      "window": 16,
+      "feature_chunk": 500000,
+      "predict_batch": 1000000,
+      "train_frac": 0.3,
+      "lgb": {
+        "learning_rate": 0.1,
+        "num_leaves": 63,
+        "min_data_in_leaf": 200,
+        "feature_fraction": 0.9,
+        "bagging_fraction": 0.8,
+        "bagging_freq": 1,
+        "num_rounds": 400,
+        "early_stopping": 30,
+        "force_col_wise": true
+      },
+      "grid": [
+        0.1,
+        0.95,
+        0.05
+      ]
+    },
+    "v5": {
+      "tfidf_run": "baseline",
+      "encoder_folds": [
+        3,
+        4
+      ],
+      "gbdt_folds": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "report_fold": 0,
+      "neural": {
+        "model": "intfloat/multilingual-e5-base",
+        "max_len": 64,
+        "n_pairs": 0,
+        "batch_size": 256,
+        "same_country_batches": true,
+        "lr": 2e-05,
+        "warmup": 0.05,
+        "epochs": 1,
+        "scale": 20.0,
+        "eval_records": 20000,
+        "encode_batch": 512,
+        "k_rec": 3,
+        "k_s1": 5,
+        "tile_gb": 4.0,
+        "gate_k": 10,
+        "weight_decay": 0.01,
+        "grad_clip": 1.0,
+        "log_every": 100,
+        "checkpoint_every": 2000,
+        "train_budget_h": 3.0
+      },
+      "cross_encoder": {
+        "enabled": false,
+        "init": "biencoder",
+        "band": [
+          null,
+          0.995
+        ],
+        "max_len": 128,
+        "batch_size": 128,
+        "lr": 2e-05,
+        "warmup": 0.05,
+        "epochs": 1,
+        "weight_decay": 0.01,
+        "grad_clip": 1.0,
+        "max_train_pairs": 2000000,
+        "score_batch": 1024,
+        "score_chunk": 500000,
+        "log_every": 100,
+        "checkpoint_every": 2000
+      },
+      "xgb": {
+        "enabled": false,
+        "device": "cpu",
+        "max_depth": 8,
+        "learning_rate": 0.05,
+        "min_child_weight": 20,
+        "subsample": 0.8,
+        "colsample_bytree": 0.9,
+        "max_bin": 256,
+        "num_rounds": 3000,
+        "early_stopping": 50
+      },
+      "ensemble_min_gain": 0.0005,
+      "llm": {
+        "enabled": false,
+        "base_url": "http://localhost:11434",
+        "model": "qwen3:4b-instruct-2507-q4_K_M",
+        "allowed_models": {
+          "qwen3:4b-instruct-2507": "Qwen3-4B-Instruct-2507, 4.0B params, Apache-2.0",
+          "qwen2.5:7b-instruct": "Qwen2.5-7B-Instruct, 7.6B params, Apache-2.0"
+        },
+        "stage2_tag": "",
+        "max_pairs_test": 40000,
+        "max_pairs_train": 20000,
+        "min_fit_pairs": 200,
+        "concurrency": 16,
+        "timeout_s": 60,
+        "retries": 3,
+        "think": null
+      },
+      "drop_encoder_records": false,
+      "early_stop_share": 0.1,
+      "prune_tau": 0.003,
+      "train_frac": 1.0,
+      "max_train_rows": 22289994,
+      "lgb": {
+        "learning_rate": 0.05,
+        "num_leaves": 127,
+        "min_data_in_leaf": 200,
+        "feature_fraction": 0.9,
+        "bagging_fraction": 0.8,
+        "bagging_freq": 1,
+        "num_rounds": 3000,
+        "early_stopping": 50,
+        "force_col_wise": true
+      },
+      "grid": [
+        0.1,
+        0.95,
+        0.05
+      ],
+      "stress_fraction": 0.19,
+      "dirs": {
+        "union": "baseline_gen",
+        "v5": "v5_lite"
+      }
+    },
+    "bootstrap": {
+      "n_resamples": 1000,
+      "alpha": 0.05,
+      "materiality": 0.002
+    }
+  },
+  "offline_metrics": {
+    "macro_f05": 0.9716917641592898,
+    "oracle_f05": 0.9847972546376398,
+    "candidates_per_s1": 4.3862722885560865,
+    "predicted_per_s1": 3.2599972811926503,
+    "per_country": {
+      "India": 0.9631393678765051,
+      "US": 0.9773983152845536
+    },
+    "per_k": {
+      "0": 0.9619893716279259,
+      "1": 0.9184273575156817,
+      "2": 0.9659029640706812,
+      "3": 0.9749535054549707,
+      "4": 0.9781498794572774,
+      "5": 0.9793707098362322,
+      "6": 0.9811434160986342
+    }
+  },
+  "n_match_pairs": 5700893,
+  "n_candidate_pairs": 8595933,
+  "leaderboard_score": null,
+  "notes": "v5: TF-IDF + fine-tuned e5 union, stage1 GBDT, prune, stage2 (lgb) (no cross-encoder)"
+}

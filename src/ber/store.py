@@ -43,6 +43,7 @@ class CountryStore:
         # Filter batch by batch: reading the whole file with ``filters=`` first
         # materializes every country's rows and leaves the freed memory in Arrow's
         # pool (measured on train India: 4.07 GB process vs 1.66 GB this way).
+        self.country = country            # lets feature code apply country-specific vocabularies
         self.tables = {}
         for s in (1, 2, 3):
             pf = pq.ParquetFile(norm_path(split, s))

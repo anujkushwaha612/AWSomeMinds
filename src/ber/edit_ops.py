@@ -95,8 +95,9 @@ def token_ops(x: str, y: str) -> set:
     return d
 
 
-def name_desc(a: str, b: str) -> set:
+def name_desc(a: str, b: str, noise=None) -> set:
     """Descriptors of the name edit S1 ``a`` -> record ``b`` (``name_tr`` strings)."""
+    NOISE = noise or NOISE_TOKENS
     A, B = a.split(), b.split()
     sa, sb = set(A), set(B)
     d = set()
@@ -113,13 +114,13 @@ def name_desc(a: str, b: str) -> set:
             if e < bd:
                 best, bd = y, e
         if best is None:
-            d.add("del_word_filler" if x in NOISE_TOKENS else ("del_word_short" if len(x) <= 2 else "del_word_content"))
+            d.add("del_word_filler" if x in NOISE else ("del_word_short" if len(x) <= 2 else "del_word_content"))
         else:
             left_b.discard(best)
             d |= token_ops(x, best)
     for y in sorted(left_b):
-        d.add("ins_word_filler" if y in NOISE_TOKENS else ("ins_word_short" if len(y) <= 2 else "ins_word_content"))
-        if y in NOISE_TOKENS:
+        d.add("ins_word_filler" if y in NOISE else ("ins_word_short" if len(y) <= 2 else "ins_word_content"))
+        if y in NOISE:
             d.add(f"ins_filler:{y}")
     if len(B) > len(sb):
         d.add("name_dup_word")
@@ -167,8 +168,9 @@ def addr_desc(a_digits: str, b_digits: str, b_addr: str) -> tuple[set, str, str]
 
 
 def edit_op_features(a_names: list[str], b_names: list[str], a_digits: list[str], b_digits: list[str],
-                     b_addr: list[str]) -> dict:
+                     b_addr: list[str], noise=None, legal=None) -> dict:
     """EDITOP_FEATURES for aligned pair lists (S1 = a, record = b)."""
+    LEG = legal or LEGAL
     table = lr_table()
     coef, bias = logit_model()
     n = len(a_names)
@@ -176,7 +178,7 @@ def edit_op_features(a_names: list[str], b_names: list[str], a_digits: list[str]
            "eo_legal_ins": np.zeros(n, np.int8), "eo_appended": np.zeros(n, np.int8), "eo_dba": np.zeros(n, np.int8),
            "eo_house_rel": np.zeros(n, np.int8), "eo_num_rel": np.zeros(n, np.int8), "eo_logit": np.zeros(n, np.float32)}
     for i in range(n):
-        nd = name_desc(a_names[i], b_names[i])
+        nd = name_desc(a_names[i], b_names[i], noise)
         ad, house, worst = addr_desc(a_digits[i], b_digits[i], b_addr[i])
         d = nd | ad
         out["eo_llr"][i] = sum(table.get(x, 0.0) for x in d)
@@ -184,7 +186,7 @@ def edit_op_features(a_names: list[str], b_names: list[str], a_digits: list[str]
         out["eo_decoy_rep"][i] = sum(1 for x in d if x.startswith("rep:") and tuple(x[4:].split(">")) in DECOY_REP)
         out["eo_ocr_rep"][i] = 1 if "rep_ocr" in d else 0
         sa = set(a_names[i].split())
-        out["eo_legal_ins"][i] = sum(1 for t in set(b_names[i].split()) - sa if t in LEGAL)
+        out["eo_legal_ins"][i] = sum(1 for t in set(b_names[i].split()) - sa if t in LEG)
         out["eo_appended"][i] = sum(1 for x in d if x.startswith("tok_appended"))
         out["eo_dba"][i] = 1 if DBA & set(b_names[i].split()) else 0
         out["eo_house_rel"][i] = NUM_REL.index(house)
