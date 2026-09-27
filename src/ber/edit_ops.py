@@ -27,6 +27,8 @@ from .features import NOISE_TOKENS, phonetic_key
 
 EDITOP_FEATURES = ["eo_llr", "eo_decoy_rep", "eo_ocr_rep", "eo_legal_ins", "eo_appended", "eo_dba",
                    "eo_house_rel", "eo_num_rel"]
+# joint model: L2 logistic regression over the same descriptor indicators (folds 3-4), written by e9_edit_ops.py
+EDITOP_LOGIT = ["eo_logit"]
 NUM_REL = ["none", "equal", "digit_dropped_first", "digit_dropped_last", "digit_dropped_mid", "digit_added",
            "digit_replaced", "digits_transposed", "shift<=10", "shift<=100", "unrelated"]
 OCR = {frozenset(p) for p in (("0", "o"), ("1", "l"), ("1", "i"), ("l", "i"), ("5", "s"), ("8", "b"), ("2", "z"),
@@ -47,8 +49,16 @@ def lr_table() -> dict:
     if "t" not in _lr_cache:
         if not os.path.exists(LR_TABLE_PATH):
             raise FileNotFoundError(f"{LR_TABLE_PATH} is missing: run experiments/e9_edit_ops.py")
-        _lr_cache["t"] = json.load(open(LR_TABLE_PATH))["log_lr"]
+        t = json.load(open(LR_TABLE_PATH))
+        _lr_cache["t"] = t["log_lr"]
+        _lr_cache["logit"] = (t.get("logit_coef", {}), float(t.get("logit_bias", 0.0)))
     return _lr_cache["t"]
+
+
+def logit_model() -> tuple[dict, float]:
+    """(descriptor -> coefficient, bias) of the joint logistic model ({} / 0 when not in the table)."""
+    lr_table()
+    return _lr_cache["logit"]
 
 
 def token_ops(x: str, y: str) -> set:
@@ -160,15 +170,17 @@ def edit_op_features(a_names: list[str], b_names: list[str], a_digits: list[str]
                      b_addr: list[str]) -> dict:
     """EDITOP_FEATURES for aligned pair lists (S1 = a, record = b)."""
     table = lr_table()
+    coef, bias = logit_model()
     n = len(a_names)
     out = {"eo_llr": np.zeros(n, np.float32), "eo_decoy_rep": np.zeros(n, np.int8), "eo_ocr_rep": np.zeros(n, np.int8),
            "eo_legal_ins": np.zeros(n, np.int8), "eo_appended": np.zeros(n, np.int8), "eo_dba": np.zeros(n, np.int8),
-           "eo_house_rel": np.zeros(n, np.int8), "eo_num_rel": np.zeros(n, np.int8)}
+           "eo_house_rel": np.zeros(n, np.int8), "eo_num_rel": np.zeros(n, np.int8), "eo_logit": np.zeros(n, np.float32)}
     for i in range(n):
         nd = name_desc(a_names[i], b_names[i])
         ad, house, worst = addr_desc(a_digits[i], b_digits[i], b_addr[i])
         d = nd | ad
         out["eo_llr"][i] = sum(table.get(x, 0.0) for x in d)
+        out["eo_logit"][i] = bias + sum(coef.get(x, 0.0) for x in d)
         out["eo_decoy_rep"][i] = sum(1 for x in d if x.startswith("rep:") and tuple(x[4:].split(">")) in DECOY_REP)
         out["eo_ocr_rep"][i] = 1 if "rep_ocr" in d else 0
         sa = set(a_names[i].split())

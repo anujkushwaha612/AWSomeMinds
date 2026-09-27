@@ -457,3 +457,18 @@ def _decoy_name_features(a_names: list[str], b_names: list[str]) -> dict:
                 q += 1
         phon[i], typo[i] = min(p, 127), min(q, 127)
     return {"nm_phonetic": phon, "nm_typo": typo}
+
+
+# Sibling signal (experiments.md E11): a true record's exact name is often repeated by other records of its
+# entity; a decoy's mutated name is one-of-a-kind (record name unique among records: decoy FPs 80%, true 55%).
+# TESTED AND NOT USED: fold-0 -0.0021 [-0.0023, -0.0019] on top of the current set (not in FEATURES_V5).
+RECFREQ_FEATURES = ["rec_name_recfreq", "s1_name_recfreq"]
+
+
+def store_recfreq_features(store, s1_names: list[str], rec_names: list[str]) -> dict:
+    """Records (S2 + S3) of the country carrying the record's / the S1's exact ``name_n`` (counts cached on the store)."""
+    if getattr(store, "_rec_name_counts", None) is None:
+        store._rec_name_counts = pd.Series(store.strings(2, "name_n") + store.strings(3, "name_n")).value_counts()
+    counts = store._rec_name_counts
+    return {"rec_name_recfreq": pd.Series(rec_names).map(counts).fillna(0).to_numpy(np.int32),
+            "s1_name_recfreq": pd.Series(s1_names).map(counts).fillna(0).to_numpy(np.int32)}

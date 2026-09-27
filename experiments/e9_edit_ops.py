@@ -28,7 +28,7 @@ from ber.edit_ops import LR_TABLE, LR_TABLE_PATH, addr_desc, name_desc
 from ber.io import load_truth_pairs
 from ber.store import CountryStore, split_countries
 
-RUN, P_MIN, N_PER = "baseline_gen", 0.3, 40_000
+RUN, P_MIN, N_TRUE, N_DECOY = "baseline_gen", 0.3, 150_000, 60_000
 TABLE_FOLDS = (3, 4)   # the LR table is learned on these entities only (encoder folds: never in the final GBDT, never fold 0)
 CLIP = 4.0
 rng = np.random.default_rng(0)
@@ -53,7 +53,8 @@ def collect(country: str, keys: pd.DataFrame, p: np.ndarray, truth, fold_ok: np.
     groups = {"true": np.flatnonzero(lab & zone), "decoy": np.flatnonzero(orphan & best & zone)}
     out = []
     for g, idx in groups.items():
-        idx = rng.choice(idx, min(N_PER // 2, len(idx)), replace=False)
+        cap = (N_TRUE if g == "true" else N_DECOY) // 2          # per country
+        idx = rng.choice(idx, min(cap, len(idx)), replace=False)
         sub = keys.iloc[idx]
         for src in (2, 3):
             ss = sub[sub.src == src]
@@ -98,7 +99,24 @@ for r in res[-30:][::-1]:
     print(f"  LR {math.exp(r['log_lr']):7.3f}  decoy {r['p_decoy']:.4f}  true {r['p_true']:.3f}  {r['desc']}")
 os.makedirs(artifact_path("experiments"), exist_ok=True)
 json.dump({"p_min": P_MIN, "folds": TABLE_FOLDS, "n": dict(n), "descriptors": res}, open(artifact_path("experiments", "E9_edit_ops.json"), "w"), indent=1)
+# joint model: L2 logistic regression on descriptor indicators (support >= 60), balanced classes
+from scipy import sparse
+from sklearn.linear_model import LogisticRegression
+vocab = sorted(r["desc"] for r in res)
+col = {d: i for i, d in enumerate(vocab)}
+ri, ci = [], []
+for i, (_, _, d) in enumerate(rows):
+    for x in d:
+        if x in col:
+            ri.append(i); ci.append(col[x])
+Xd = sparse.csr_matrix((np.ones(len(ri), np.float32), (ri, ci)), shape=(len(rows), len(vocab)))
+yd = np.array([g == "decoy" for g, _, _ in rows], dtype=np.int8)
+clf = LogisticRegression(C=0.5, class_weight="balanced", max_iter=2000).fit(Xd, yd)
+from sklearn.metrics import roc_auc_score
+nb = np.asarray(Xd @ np.array([np.clip(r["log_lr"], -CLIP, CLIP) for r in sorted(res, key=lambda r: r["desc"])]))
+print(f"in-sample AUC decoy vs true: naive Bayes {roc_auc_score(yd, nb):.4f} | logistic {roc_auc_score(yd, clf.decision_function(Xd)):.4f}")
 json.dump({"folds": TABLE_FOLDS, "p_min": P_MIN, "clip": CLIP,
-           "log_lr": {r["desc"]: float(np.clip(r["log_lr"], -CLIP, CLIP)) for r in res}},
+           "log_lr": {r["desc"]: float(np.clip(r["log_lr"], -CLIP, CLIP)) for r in res},
+           "logit_coef": {d: float(w) for d, w in zip(vocab, clf.coef_[0])}, "logit_bias": float(clf.intercept_[0])},
           open(LR_TABLE_PATH, "w"), indent=1)                      # versioned: configs/E9_lr_table.json
 print(f"wrote {LR_TABLE}: {len(res)} descriptors (folds {TABLE_FOLDS})")

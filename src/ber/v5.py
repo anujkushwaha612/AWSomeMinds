@@ -52,6 +52,12 @@ from .union import FEATURES_V5
 STAGE2 = ["p1", "rec_pmax", "rec_p2", "p_minus_rec_other", "rec_prank", "rec_n",
           "s1src_pmax", "s1src_prank", "s1src_n05", "s1src_psum", "p_minus_s1src_other",
           "s1_n05", "s1_pmax_other_src", "s1_n_best"]
+# Record-relative S1 counts (experiments.md E10): among a record's candidates, the true parent of an ambiguous
+# (chain) record tends to be the S1 with the FEWEST other confident records from the same source and the MOST
+# from the other source; absolute counts (s1src_n05, s1_n05) do not compare candidates. Switch: v5.stage2_rel
+# (default off: E10 measured +0.00006 [-0.00000, +0.00011] on v5-lite stage 2).
+STAGE2_REL = ["s1_same_src_hi_other", "s1_other_src_hi", "rel_same_src_min_gap", "rel_other_src_max_gap",
+              "rel_z_max_gap", "rec_n_close"]
 CE_FEATURES = ["ce", "ce_minus_rec_other"]
 log = logging.getLogger("ber.v5")
 
@@ -393,6 +399,33 @@ def group_stats(key: np.ndarray, p: np.ndarray, extra: np.ndarray | None = None)
     return {k: v[inv] for k, v in stats.items()}
 
 
+def stage2_rel_features(keys: pd.DataFrame, p: np.ndarray) -> pd.DataFrame:
+    """STAGE2_REL: each candidate S1's confident-record counts relative to the record's other candidates."""
+    c = keys["country"].to_numpy(np.int64)
+    src = keys["src"].to_numpy(np.int64)
+    doc = keys["doc_row"].to_numpy(np.int64)
+    s1 = keys["s1_row"].to_numpy(np.int64)
+    p = np.asarray(p, dtype=np.float64)
+    hi = (p > 0.5).astype(np.float64)
+    same = group_stats((c << 40) | (src << 32) | s1, p, hi)["extra_sum"] - hi      # other same-source records
+    allsrc = group_stats((c << 40) | s1, p, hi)["extra_sum"] - hi
+    other = allsrc - same                                                          # other-source records
+    rec = pd.Series((c << 40) | (src << 32) | doc)
+    z = other - same
+    df = pd.DataFrame({"rec": rec, "same": same, "other": other, "z": z, "p": p})
+    g = df.groupby("rec")
+    pmax = g["p"].transform("max").to_numpy()
+    out = pd.DataFrame({
+        "s1_same_src_hi_other": same.astype(np.float32),
+        "s1_other_src_hi": other.astype(np.float32),
+        "rel_same_src_min_gap": (same - g["same"].transform("min").to_numpy()).astype(np.float32),
+        "rel_other_src_max_gap": (g["other"].transform("max").to_numpy() - other).astype(np.float32),
+        "rel_z_max_gap": (g["z"].transform("max").to_numpy() - z).astype(np.float32),
+        "rec_n_close": (df.assign(close=(p >= pmax - 0.1)).groupby("rec")["close"].transform("sum")).to_numpy(np.float32),
+    })
+    return out[STAGE2_REL]
+
+
 def stage2_features(keys: pd.DataFrame, p: np.ndarray) -> pd.DataFrame:
     """Competition / count features from stage-1 p, aligned with ``keys`` rows.
 
@@ -619,7 +652,7 @@ def load_ce(split: str, n: int) -> np.ndarray:
 
 
 def stage2_matrix(split: str, keys: pd.DataFrame, p1: np.ndarray, kept: np.ndarray,
-                  base: list[str], ce: np.ndarray | None = None) -> np.ndarray:
+                  base: list[str], ce: np.ndarray | None = None, rel: bool = False) -> np.ndarray:
     """[base features, STAGE2 (, CE_FEATURES)] for the pruned rows.
 
     STAGE2 and the CE margin are computed among the pruned rows only (the rows the
@@ -627,6 +660,8 @@ def stage2_matrix(split: str, keys: pd.DataFrame, p1: np.ndarray, kept: np.ndarr
     """
     kk = keys[kept].reset_index(drop=True)
     parts = [read_matrix(split, kept, base), stage2_features(kk, p1[kept]).to_numpy(np.float32)]
+    if rel:
+        parts.append(stage2_rel_features(kk, p1[kept]).to_numpy(np.float32))
     if ce is not None:
         parts.append(ce_features(kk, ce[kept]).to_numpy(np.float32))
     return np.hstack(parts)
@@ -641,7 +676,8 @@ def stage2(tag: str = "", use_ce: bool | None = None) -> None:
     if len(p1) != len(keys):
         raise ValueError(f"p1_train has {len(p1)} rows for {len(keys)} train pairs: rerun stage1")
     base = stage1_features()
-    names = base + STAGE2 + (CE_FEATURES if use_ce else [])
+    rel = bool(v.get("stage2_rel", False))          # E10: +0.00006, CI touches 0 -> off by default
+    names = base + STAGE2 + (STAGE2_REL if rel else []) + (CE_FEATURES if use_ce else [])
     ce = load_ce("train", len(keys)) if use_ce else None
     kept = p1 >= v["prune_tau"]
     kk = keys[kept].reset_index(drop=True)
@@ -650,15 +686,22 @@ def stage2(tag: str = "", use_ce: bool | None = None) -> None:
     in_gbdt = np.isin(fold, v["gbdt_folds"])
     if v["drop_encoder_records"]:
         in_gbdt &= ~encoder_seen(kk)
-    X = stage2_matrix("train", keys, p1, kept, base, ce)
+    X = stage2_matrix("train", keys, p1, kept, base, ce, rel)
     del ce
     name = "stage2" + sfx(tag)
     ent_k = entity_key(kk["country"], kk["s1_row"])
     log.info(f"[{name}] pruned to {len(kk):,} pairs (tau {v['prune_tau']}); matrix {X.shape}; "
              f"cross-encoder features {'ON' if use_ce else 'OFF'}; xgboost {'ON' if xgb_enabled() else 'OFF'} "
              f"{mem_str()}")
-    members = {"lgb": predict_cross(cross_fit(X[in_gbdt], y[in_gbdt], fold[in_gbdt], ent_k[in_gbdt],
-                                              names, name), X, fold)}
+    # memory: never hold the full matrix and its training copy at once (the union run is ~2x larger);
+    # train on the copy, then rebuild the full matrix for the out-of-fold predictions
+    holder = [X[in_gbdt]]
+    del X
+    gc.collect()
+    lgb_models = cross_fit(holder.pop(), y[in_gbdt], fold[in_gbdt], ent_k[in_gbdt], names, name)
+    gc.collect()
+    X = stage2_matrix("train", keys, p1, kept, base, load_ce("train", len(keys)) if use_ce else None, rel)
+    members = {"lgb": predict_cross(lgb_models, X, fold)}
     gc.collect()
     if xgb_enabled():
         members["xgb"] = predict_cross(xgb_cross_fit(X[in_gbdt], y[in_gbdt], fold[in_gbdt], ent_k[in_gbdt],
@@ -670,7 +713,7 @@ def stage2(tag: str = "", use_ce: bool | None = None) -> None:
     np.save(run_path(f"p2_train{sfx(tag)}.npy"), p2)
     np.save(run_path(f"kept_train{sfx(tag)}.npy"), kept)
     keep = apply_rule(kk, p2, rules)
-    res = {"prune_tau": v["prune_tau"], "tag": tag, "use_ce": bool(use_ce), "base_features": base,
+    res = {"prune_tau": v["prune_tau"], "tag": tag, "use_ce": bool(use_ce), "stage2_rel": rel, "base_features": base,
            "features": names, "ensemble": ens, "rules": rules, "report": report(name, kk, ents, keep)}
     log.info(f"[{name}] chosen rule {rules['chosen']}: threshold tune {rules['threshold']['tune_f05']:.5f} "
              f"report {rules['threshold']['report_f05']:.5f} | expected-F tune "
@@ -706,7 +749,8 @@ def write_outputs(kk: pd.DataFrame, keep: np.ndarray, log_tag: str) -> tuple[str
 def test_p2(res: dict, tag: str, keys: pd.DataFrame, p1: np.ndarray, kept: np.ndarray) -> np.ndarray:
     """Stage-2 p of the pruned test pairs: mean of the fold models of each member, then the ensemble rule."""
     X = stage2_matrix("test", keys, p1, kept, res.get("base_features", FEATURES_V5),
-                      load_ce("test", len(keys)) if res.get("use_ce", False) else None)
+                      load_ce("test", len(keys)) if res.get("use_ce", False) else None,
+                      rel=res.get("stage2_rel", False))                 # runs before E10 have no REL features
     ens = res.get("ensemble", {"members": ["lgb"], "chosen": "lgb"})
     members = {}
     for m in ens["members"]:

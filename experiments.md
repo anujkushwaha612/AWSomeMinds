@@ -457,3 +457,14 @@ fold 0) on top of GEN + CHAIN + DECOY: 0.96687 → **0.97112, Δ +0.0043 [+0.003
 → KEEP (in `FEATURES_V5`). Fix found on the way: token matching iterated Python sets, whose order depends on the
 process hash seed; now sorted, so features are identical across processes (union train vs test, worker pool).
 Union featurization: the Python-loop features run on a process pool (36 µs/pair vs 121 µs serial, identical output).
+
+**E10 / E11 (2026-09-27, measured, not kept).** Record-relative chain counts in stage 2 (`v5.STAGE2_REL`,
+[experiments/e10_chain_resolution.py](experiments/e10_chain_resolution.py)): on v5-lite stage 2 +0.00006
+[−0.00000, +0.00011] → off by default. Record-name frequency across records (`RECFREQ_FEATURES`,
+[experiments/e11_harness.py](experiments/e11_harness.py), real union code path, 200k/50k/150k entities):
+−0.0021 [−0.0023, −0.0019] → not used. Joint logistic model over the E9 descriptors (`eo_logit`; in-sample AUC
+0.947 vs naive Bayes 0.902): −0.0011 [−0.0013, −0.0009] → not used. The E9 table rebuilt on a bigger folds-3–4
+sample (150k true / 52k decoys, 215 descriptors) lifts the current set from 0.97150 to **0.97286** on the same
+entities → kept (`configs/E9_lr_table.json`). Structure checks: test = train-like entities + extra orphans
+(records/S1 × (1 − orphan share) = 3.46–3.49 = train's true matches/S1); France not under-predicted; S2 / S3
+counts per entity nearly independent (corr 0.12).
