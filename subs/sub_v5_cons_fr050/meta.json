@@ -1,0 +1,202 @@
+{
+  "name": "sub_v5_cons_fr050",
+  "created_utc": "2026-09-27T08:49:31+00:00",
+  "commit": "0af7408ac7e0a70011b4bda0ff9d2dd2dcb4f278-dirty",
+  "config": {
+    "data_root": "data/dataset",
+    "artifacts_root": "artifacts",
+    "seed": 2026,
+    "validation": {
+      "n_folds": 5,
+      "report_fold": 0,
+      "k_buckets": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ]
+    },
+    "blocking": {
+      "ngram": [
+        3,
+        3
+      ],
+      "min_df": 2,
+      "max_df": 0.1,
+      "views": [
+        "NA",
+        "A",
+        "N"
+      ],
+      "k_forward": 50,
+      "k_reverse": 10,
+      "query_chunk": 20000,
+      "n_threads": 0
+    },
+    "baseline": {
+      "k_rec": 3,
+      "max_df": 0.01,
+      "min_score": 0.0,
+      "workers": 8,
+      "chunk": 50000,
+      "window": 16,
+      "feature_chunk": 500000,
+      "predict_batch": 1000000,
+      "train_frac": 0.3,
+      "lgb": {
+        "learning_rate": 0.1,
+        "num_leaves": 63,
+        "min_data_in_leaf": 200,
+        "feature_fraction": 0.9,
+        "bagging_fraction": 0.8,
+        "bagging_freq": 1,
+        "num_rounds": 400,
+        "early_stopping": 30,
+        "force_col_wise": true
+      },
+      "grid": [
+        0.1,
+        0.95,
+        0.05
+      ]
+    },
+    "v5": {
+      "tfidf_run": "baseline",
+      "encoder_folds": [
+        3,
+        4
+      ],
+      "gbdt_folds": [
+        0,
+        1,
+        2
+      ],
+      "report_fold": 0,
+      "neural": {
+        "model": "intfloat/multilingual-e5-base",
+        "max_len": 64,
+        "n_pairs": 0,
+        "batch_size": 256,
+        "same_country_batches": true,
+        "lr": 2e-05,
+        "warmup": 0.05,
+        "epochs": 1,
+        "scale": 20.0,
+        "eval_records": 20000,
+        "encode_batch": 512,
+        "k_rec": 3,
+        "k_s1": 5,
+        "tile_gb": 4.0,
+        "gate_k": 10,
+        "weight_decay": 0.01,
+        "grad_clip": 1.0,
+        "log_every": 100,
+        "checkpoint_every": 2000,
+        "train_budget_h": 3.0
+      },
+      "cross_encoder": {
+        "enabled": false,
+        "init": "biencoder",
+        "band": [
+          null,
+          0.995
+        ],
+        "max_len": 128,
+        "batch_size": 128,
+        "lr": 2e-05,
+        "warmup": 0.05,
+        "epochs": 1,
+        "weight_decay": 0.01,
+        "grad_clip": 1.0,
+        "max_train_pairs": 2000000,
+        "score_batch": 1024,
+        "score_chunk": 500000,
+        "log_every": 100,
+        "checkpoint_every": 2000
+      },
+      "xgb": {
+        "enabled": false,
+        "device": "cpu",
+        "max_depth": 8,
+        "learning_rate": 0.05,
+        "min_child_weight": 20,
+        "subsample": 0.8,
+        "colsample_bytree": 0.9,
+        "max_bin": 256,
+        "num_rounds": 3000,
+        "early_stopping": 50
+      },
+      "ensemble_min_gain": 0.0005,
+      "llm": {
+        "enabled": false,
+        "base_url": "http://localhost:11434",
+        "model": "qwen3:4b-instruct-2507-q4_K_M",
+        "allowed_models": {
+          "qwen3:4b-instruct-2507": "Qwen3-4B-Instruct-2507, 4.0B params, Apache-2.0",
+          "qwen2.5:7b-instruct": "Qwen2.5-7B-Instruct, 7.6B params, Apache-2.0"
+        },
+        "stage2_tag": "",
+        "max_pairs_test": 40000,
+        "max_pairs_train": 20000,
+        "min_fit_pairs": 200,
+        "concurrency": 16,
+        "timeout_s": 60,
+        "retries": 3,
+        "think": null
+      },
+      "drop_encoder_records": false,
+      "early_stop_share": 0.1,
+      "prune_tau": 0.003,
+      "train_frac": 1.0,
+      "max_train_rows": 12000000,
+      "lgb": {
+        "learning_rate": 0.05,
+        "num_leaves": 127,
+        "min_data_in_leaf": 200,
+        "feature_fraction": 0.9,
+        "bagging_fraction": 0.8,
+        "bagging_freq": 1,
+        "num_rounds": 3000,
+        "early_stopping": 50,
+        "force_col_wise": true
+      },
+      "grid": [
+        0.1,
+        0.95,
+        0.05
+      ],
+      "stress_fraction": 0.19
+    },
+    "bootstrap": {
+      "n_resamples": 1000,
+      "alpha": 0.05,
+      "materiality": 0.002
+    }
+  },
+  "offline_metrics": {
+    "macro_f05": 0.988856768426698,
+    "oracle_f05": 0.998662807125453,
+    "candidates_per_s1": 5.013342547069352,
+    "predicted_per_s1": 3.3742914108344473,
+    "per_country": {
+      "India": 0.989215638820963,
+      "US": 0.9886173136371279
+    },
+    "per_k": {
+      "0": 0.9836112125268752,
+      "1": 0.9599902307606235,
+      "2": 0.9879858299231192,
+      "3": 0.9906000998563086,
+      "4": 0.9916956896263421,
+      "5": 0.9922526918553097,
+      "6": 0.9928992504431605
+    }
+  },
+  "n_match_pairs": 5927905,
+  "n_candidate_pairs": 8831989,
+  "leaderboard_score": null,
+  "notes": "stage2_cons (E16 record consensus) with France-only stage-2 odds x0.5; India / US identical to the plain cons submission"
+}

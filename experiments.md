@@ -468,3 +468,138 @@ sample (150k true / 52k decoys, 215 descriptors) lifts the current set from 0.97
 entities → kept (`configs/E9_lr_table.json`). Structure checks: test = train-like entities + extra orphans
 (records/S1 × (1 − orphan share) = 3.46–3.49 = train's true matches/S1); France not under-predicted; S2 / S3
 counts per entity nearly independent (corr 0.12).
+
+---
+
+## E16 — Where France loses, and record consensus (2026-09-27, afternoon)
+
+**France profile (0.980 run, test, arbitrated pairs).** The model *sees* France as harder: 0.80 pairs/S1 with
+0.05 < p2 < 0.95 vs 0.25 in India/US test; self-estimated F0.5 (Monte-Carlo under the isotonic calibration)
+0.973 vs 0.991. On labeled fold 0 the self-estimate is ~0.0045 optimistic (0.9923–0.9928 vs true 0.9880), so a
+calibrated France would score ~0.968; the LB puts it at ~0.936 → France is both more uncertain AND over-confident.
+France gets an empty prediction for 5.2% of S1s (India/US 5.7%, train singleton share 5.6%), so the probe's
+singleton assumption (F(France) ≈ 0.881 + 0.055) holds. Chain names are NOT more common in France (share of S1
+names shared by > 30 S1s: France 0.11, India 0.31, US 0.10).
+
+**Rejected hypothesis: legal-form change = decoy.** Labeled folds 1–4, rec_best pairs with p2 ≥ 0.05: a changed
+legal form (both sides have one, different) is 25% true in India but 83% true in the US; France's changed-form
+pairs are already mostly rejected (19% kept, 0.03 pairs/S1). Nothing to gain.
+
+**Found: the S1 is itself a noisy copy.** When a record's address number is missing from the S1 but carried by
+another candidate record of the same S1, the pair is almost always true, and stage 2 does not know it
+(labeled folds 1–4, rec_best, 0.05 ≤ p2 ≤ 0.995):
+
+| p2 band | true rate, deviating number unique to the record | true rate, shared with ≥ 1 other record | mean p2 |
+|---|---|---|---|
+| 0.05–0.3 | 0.10 | 0.54–0.72 | 0.15 |
+| 0.3–0.55 | 0.38 | 0.82–0.88 | 0.43 |
+| 0.55–0.75 | 0.58 | 0.92–0.94 | 0.66 |
+| 0.75–0.9 | 0.78 | 0.97–0.98 | 0.84 |
+
+The same consensus on name tokens carries almost no residual signal. Reading: the generator edits the S1's house
+number like any record's, so true records agree with each other against the S1, while a decoy's deviation is its
+own. Language-agnostic, so it applies to France unchanged (France's borderline pairs are dominated by house-number
+mismatches). Features: `ber.consensus.CONS_FEATURES` (13, stage 2 only), runner
+[experiments/e16_consensus.py](experiments/e16_consensus.py).
+
+**Result (stage 2 retrained on the 0.980 run's stage 1, same folds / rule tuning):** fold-0 macro F0.5
+**0.98886** vs 0.98794 (India 0.9880 → 0.9892, US 0.9879 → 0.9886), paired bootstrap **+0.00091, CI [+0.00082,
++0.00101]**: real, below the 0.002 materiality bar. `cn_sh_num_hi` is the 3rd feature by gain (after
+p_minus_rec_other and p1). Rule chosen: expected-F (tune 0.98926). Kept for the final submission because it is the
+only measured India/US gain of the day and is vocabulary-free (France should gain at least as much).
+Final run: [run_final_cons.ps1](run_final_cons.ps1) → `subs/sub_v5_cons` + France-only odds variants
+(`fr-odds`, verified: odds 0.6 on the 0.980 arrays reproduces `sub_v5_fr_strict060` byte for byte).
+Where France stands after this (test, 0.05 ≤ p2 ≤ 0.95): only 26% of France's zone pairs have a deviating house
+number (India 32%, US 44%); France's name deviations are almost never shared with other records (2.4% vs India
+10.6%), so its remaining uncertainty is name-driven (word swaps at identical addresses) and not reachable offline.
+
+**E16 verdict: `sub_v5_cons` NOT uploaded — it is fooled on test.** Offline it predicts slightly fewer matches than
+the 0.980 model (3.37 vs 3.38 /S1), on test clearly more (US 3.397 → 3.465, India 3.393 → 3.411; the decision rule
+is not the cause: thresholds give 3.473). The pairs it newly accepts on test are **siblings of a deleted S1**: the
+generator makes near-duplicate entities (same name ± legal form, house number a few apart: `Neor | 3905 Cedar Creek
+Dr` vs `Neor Llc / Neor Inc | 3907 Cedar Creek Dr`); in train the sibling's own S1 exists and wins its records, in test
+many were deleted, so the sibling's record group latches onto the survivor and fakes a consensus. Signature: newly
+accepted pairs share their deviating number with other records (cn_sh_num 1.30 on test US) but almost never with a
+confident one (cn_sh_num_hi 0.16; train fold 0: 1.18 / 1.00). The 0.980 model already accepts this "sibling group"
+pattern (deviating number shared only with p1 < 0.5 records, S1's number carried by others) far more on test than in
+train, where it is 99% true: per S1 train India / US 0.0045 / 0.0053, test India 0.0074, US 0.0131, **France 0.0278
+(6×)** — the likely mechanism of France's over-confidence (France's small name vocabulary makes many siblings).
+Robust variant `consr` (confident-partner counts only) retrained; see E17 for the deletion stress test.
+
+---
+
+## E17 — Deleted-S1 stress test; robust consensus `consr` (2026-09-27)
+
+`consr` = stage 2 with only the confident-partner consensus counts (`experiments/e16_consensus.py` ROBUST:
+cn_dev_num, cn_sh_num_hi, cn_miss_num, cn_dev_atok, cn_sh_atok_hi, cn_dev_tok, cn_sh_tok_hi, cn_n_other_hi).
+Fold 0: **0.98875 vs 0.98794, +0.00080 CI [+0.00071, +0.00089]** (the fooled full set: +0.00091).
+
+**Stress test** ([experiments/e17_stress.py](experiments/e17_stress.py)): delete 19% of train S1 entities (test's orphan
+share), recompute the stage-2 competition features on what is left (p1 kept: stage 1 is ~95% gap_s1, S1-side),
+score fold-0 survivors: noce 0.98803 → 0.98741 (−0.00062), consr 0.98882 → 0.98819 (−0.00063); under deletion
+consr − noce = +0.00078 CI [+0.00068, +0.00088]. Deletion costs India/US only ~0.0006 (consistent with the LB, where
+India/US test ≈ offline), so retraining on a deleted universe is not worth it for India/US.
+
+**On test** `consr` behaves as offline: matches/S1 India 3.3933 → 3.3949, US 3.3974 → 3.3989 (the fooled `cons`:
+3.4110 / 3.4645); its added India/US pairs have confident support (cn_sh_num_hi 1.09 / 1.00, train 1.00); France gets
+stricter (3.4160 → 3.4008: adds 0.036/S1, removes 0.051/S1). Submissions: `subs/sub_v5_consr` (+ France-only odds
+variants `_fr050` −2.3%, `_fr030` −3.9% of France matches, India/US byte-identical). LB: _pending_.
+
+---
+
+## E18 — Where the loss is, seen differently; leave-one-country-out stage 2 (2026-09-27, evening)
+
+**LB arithmetic.** LB = 0.85·F(India+US) + 0.15·F(France). With India/US at the offline 0.9887 (consr) and LB 0.981,
+F(France) ≈ 0.937. **≥ 0.99 is out of reach by France alone**: France at India/US parity (0.989) gives LB 0.989; 0.99 needs
+e.g. India/US 0.993 AND France 0.975. Caveat: the France-empty probe identifies only F(France) − singleton share
+(0.881); "India/US test = offline" rests on France's singleton share being train's 5.6% (bounded ≤ 8.6% by France's 5.2%
+predicted-empty S1s, i.e. F(France) ∈ [0.936, 0.966], F(India+US) test ∈ [0.982, 0.988]).
+
+**France predicts the right NUMBER of matches.** Predicted matches per S1 per source, histogram 0..6: France S2 mean
+1.651 / S3 1.750 vs India 1.647 / 1.748, US 1.643 / 1.756, train (≈ truth) 1.643 / 1.744 — the shapes agree to ~0.003 per
+bucket. France's loss is therefore **swaps** (a wrong record chosen in place of a right one), not over-acceptance: no
+strictness / odds / threshold knob can fix it (it trades FP for FN), which is why the France calibration probes moved
+nothing. France is not structurally harder either: S1 core names shared by ≥ 2 S1s France 0.495 (India 0.531, US
+0.389–0.466), empty record addresses 3.0% (2.3–3.7%).
+
+**India/US loss by true match count k (consr, fold 0, total 0.0113):** k=0 0.0009, k=1 0.0022, k=2 0.0021, k=3 0.0023,
+k=4 0.0018, k=5 0.0011, k≥6 0.0008. FN-driven (entities missing ≥ 1 true match: k=3 7.7%, k=5 12.5%) rather than FP
+(0.4–1.9%): ~0.0077 of the 0.0113 is rejected / unretrieved true pairs.
+
+**LOCO** ([experiments/e18_loco.py](experiments/e18_loco.py)): stage 2 (consr feature set) fit on one country's fold 2,
+calibrated + expected-F rule on its fold 1, scored on fold 0 of both countries (p1 from the 0.980 stage 1; the E6 vocab
+and E9 table were mined on both countries, so this is optimistic for cross-country).
+
+| Features | India: in-country / from US / gap | US: in-country / from India / gap | self-estimate optimism cross |
+|---|---|---|---|
+| full (88) | 0.98854 / 0.98683 / +0.0017 | 0.98807 / 0.98655 / +0.0015 | +0.0023 / +0.0059 |
+| agnostic (− E9, name-vocab, translit, chain freq) | 0.98853 / 0.98698 / +0.0016 | 0.98789 / 0.98650 / +0.0014 | +0.0026 / +0.0059 |
+| no E9 | 0.98848 / 0.98686 / +0.0016 | 0.98794 / 0.98655 / +0.0014 | +0.0018 / +0.0059 |
+| no dense | 0.98853 / 0.98690 / +0.0016 | 0.98798 / 0.98636 / +0.0016 | +0.0023 / +0.0059 |
+
+The stage-2 model transfers between India and US for ~0.0015 whatever the feature set, and its self-estimate stays
+honest (optimism ≤ 0.006, France: 0.037). Dropping vocabulary features is not the France fix; France is further out.
+
+**France's gray zone is legal forms.** rec_best pairs with 0.05 < p2 < 0.95: France 0.75 / S1 vs India 0.22, US 0.25; of
+them name-substitution 0.34 / S1 (India 0.09, US 0.06) and name-insertion 0.41 (0.12, 0.08). Single-token substitutions
+in France's gray zone: sarl→sa 2,771, sarl→sas 2,691, sas→sa 2,000, sarl→sci 1,867, sarl→snc 1,778, sarl→eurl 1,617 …;
+pure single insertions: sarl / sas / sci / eurl / sa / snc / sasu (~19k), then developpement, groupe, france …
+Names equal up to legal forms, same house number (zhouse_state = 1):
+
+| | legal form swapped: pairs/S1, mean p2, true | legal form added | legal form dropped |
+|---|---|---|---|
+| India train | 0.031, 0.935, **0.934** | 0.046, 0.970, 0.968 | 0.106, 0.998, 0.998 |
+| US train | 0.035, 0.977, **0.976** | 0.184, 0.992, 0.993 | 0.233, 1.000, 1.000 |
+| France test | 0.018, **0.367 (22% kept)** | 0.173, 0.976 | 0.322, 0.984 |
+
+## E19 — Legal forms were aligned as letter edits in the E9 descriptors (2026-09-27)
+
+Cause of the table above: `edit_ops.name_desc` aligned each S1 token missing from the record with the closest record token
+(Levenshtein) and emitted character-edit descriptors. French legal forms are prefixes of each other, so a legal-form
+swap fired E9's decoy fingerprints: `sa → sas` = `tok_appended:s` (eo_llr +3.30), `sasu → sas` +2.95, `sas → sa` +1.63,
+`sarl → eurl` +1.25, `sarl → sa` +1.01 (US `llc → inc` +6.76, but US has labels to learn around it; France has none).
+Fix `edit_ops.SKIP_LEGAL_ALIGN` (default on): tokens of `LEGAL_FORMS` (all countries' legal forms) are whole-word filler
+edits and never aligned; real decoy fingerprints are unchanged (`quantyn → kwantyn` +2.42, `zephial → zephiala` +9.80).
+[experiments/e19_legal_align.py](experiments/e19_legal_align.py): with the fix OFF it reproduces the stored union
+EDITOP columns exactly (max |diff| 0, train and test incl. France); with it ON the 8 EDITOP columns of every pruned pair are
+recomputed and the consr stage 2 is retrained on them (same stage 1, folds, rule tuning).

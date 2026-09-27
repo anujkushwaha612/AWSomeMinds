@@ -39,6 +39,14 @@ DECOY_REP = {("d", "p"), ("s", "z"), ("k", "c"), ("a", "i"), ("a", "x"), ("i", "
 LEGAL = frozenset({"pvt", "private", "llp", "ltd", "limited", "llc", "inc", "corp", "corporation", "co", "company",
                    "lp", "pllc", "pc", "incorporated", "praivet", "piraivet"})
 DBA = frozenset({"dba", "formerly", "fka", "aka", "doing"})
+# Legal forms of every country (E19). A legal-form change is a whole-word generator edit, never a character mutation:
+# aligned with Levenshtein, French forms (prefixes of each other: sa / sas / sasu, sarl / eurl) fired the decoy letter
+# fingerprints (sa -> sas = "tok_appended:s", log-LR +3.3; US llc -> inc = rep:l>i + rep:l>n, +6.8). France is unseen in
+# training, so there the model read every legal-form swap as a decoy (same-address swaps: mean p2 0.37 on test vs
+# 93-98% true in India / US train). SKIP_LEGAL_ALIGN = False reproduces the descriptors of the E9 table / 0.980 run.
+LEGAL_FORMS = LEGAL | frozenset({"sarl", "sas", "sasu", "sa", "eurl", "sci", "snc", "ei", "selarl", "scop", "gie", "cie",
+                                 "lnc", "llp", "plc", "opc"})
+SKIP_LEGAL_ALIGN = True
 LR_TABLE = "E9_lr_table.json"
 LR_TABLE_PATH = os.path.join(REPO_ROOT, "configs", LR_TABLE)
 _lr_cache = {}
@@ -98,6 +106,8 @@ def token_ops(x: str, y: str) -> set:
 def name_desc(a: str, b: str, noise=None) -> set:
     """Descriptors of the name edit S1 ``a`` -> record ``b`` (``name_tr`` strings)."""
     NOISE = noise or NOISE_TOKENS
+    skip = LEGAL_FORMS if SKIP_LEGAL_ALIGN else frozenset()
+    NOISE = NOISE | skip
     A, B = a.split(), b.split()
     sa, sb = set(A), set(B)
     d = set()
@@ -109,7 +119,7 @@ def name_desc(a: str, b: str, noise=None) -> set:
     for x in sorted(sa - sb):                   # sorted: set order depends on the process hash seed
         lim = max(2, len(x) // 3)
         best, bd = None, lim + 1
-        for y in sorted(left_b):
+        for y in (() if x in skip else sorted(left_b - skip)):
             e = Levenshtein.distance(x, y, score_cutoff=lim)
             if e < bd:
                 best, bd = y, e
